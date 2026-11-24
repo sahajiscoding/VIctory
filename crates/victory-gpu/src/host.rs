@@ -2268,6 +2268,24 @@ fn present_srv_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
     })
 }
 
+/// Whether a presented texture format belongs to a different DXGI typeless
+/// family than its swap-chain back buffer (`B8G8R8X8*` vs `B8G8R8A8_UNORM`),
+/// requiring the blitter instead of `CopyResource`.
+fn needs_format_blit(format: DXGI_FORMAT) -> bool {
+    matches!(format.0, 88 | 92 | 93)
+}
+
+/// RTV format used by the present blitter on the swap-chain back buffer.
+/// Concrete sRGB source textures decode sRGB -> linear on SRV sampling, so the
+/// blitter must write through a matching sRGB RTV to encode back to sRGB.
+fn present_blit_rtv_format(swap: DXGI_FORMAT, src: DXGI_FORMAT) -> DXGI_FORMAT {
+    match (swap, src.0) {
+        (DXGI_FORMAT_R8G8B8A8_UNORM, 29) => DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+        (DXGI_FORMAT_B8G8R8A8_UNORM, 91 | 93) => DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
+        _ => swap,
+    }
+}
+
 /// Swap chain color space matching the presented back-buffer format.
 fn swap_color_space(format: DXGI_FORMAT, hdr: bool) -> DXGI_COLOR_SPACE_TYPE {
     match format {
@@ -2684,13 +2702,16 @@ impl Host {
                 );
             }
         }
-        let need_blit = planes.len() > 1 || (tex_width, tex_height) != (width, height);
+        let need_blit = planes.len() > 1
+            || (tex_width, tex_height) != (width, height)
+            || needs_format_blit(desc.Format);
+        let blit_format = present_blit_rtv_format(format, desc.Format);
         if need_blit
             && p.blitter
                 .as_ref()
-                .is_none_or(|b| b.pso_format != format)
+                .is_none_or(|b| b.pso_format != blit_format)
         {
-            p.blitter = match Blitter::new(&self.device, format) {
+            p.blitter = match Blitter::new(&self.device, blit_format) {
                 Ok(b) => Some(b),
                 Err(e) => {
                     tracing::warn!(error = %e, "present scaling blitter unavailable");
@@ -2712,7 +2733,15 @@ impl Host {
                 && present_srv_format(desc.Format).is_some()
                 && desc.Flags.0 & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE.0 == 0
             {
-                let rtv = self.rtv(&back, None);
+                let back_rtv_desc =
+                    (blit_format != format).then_some(D3D12_RENDER_TARGET_VIEW_DESC {
+                        Format: blit_format,
+                        ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
+                        Anonymous: D3D12_RENDER_TARGET_VIEW_DESC_0 {
+                            Texture2D: D3D12_TEX2D_RTV::default(),
+                        },
+                    });
+                let rtv = self.rtv(&back, back_rtv_desc.as_ref());
                 let cpu_start = blitter.srv_heap.GetCPUDescriptorHandleForHeapStart();
                 let gpu_start = blitter.srv_heap.GetGPUDescriptorHandleForHeapStart();
                 let mut active: Vec<(&ID3D12Resource, D3D12_RESOURCE_STATES, u32)> = Vec::new();
@@ -3514,5 +3543,56 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert!(!super::gpu_writes_cover(&[(100, 199), (200, 300)], 100, 300));
         assert!(!super::gpu_writes_cover(&[(101, 300)], 100, 300));
         assert!(!super::gpu_writes_cover(&[], 100, 300));
+    }
+
+    #[test]
+    fn present_blit_handles_b8g8r8x8_and_srgb_roundtrip() {
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
+            DXGI_FORMAT_B8G8R8X8_TYPELESS, DXGI_FORMAT_B8G8R8X8_UNORM,
+            DXGI_FORMAT_B8G8R8X8_UNORM_SRGB, DXGI_FORMAT_R8G8B8A8_TYPELESS,
+            DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+        };
+        // B8G8R8X8* cannot be copied directly into a B8G8R8A8_UNORM swap buffer.
+        assert!(super::needs_format_blit(DXGI_FORMAT_B8G8R8X8_UNORM));
+        assert!(super::needs_format_blit(DXGI_FORMAT_B8G8R8X8_TYPELESS));
+        assert!(super::needs_format_blit(DXGI_FORMAT_B8G8R8X8_UNORM_SRGB));
+        assert!(!super::needs_format_blit(DXGI_FORMAT_B8G8R8A8_UNORM));
+        assert!(!super::needs_format_blit(DXGI_FORMAT_R8G8B8A8_UNORM));
+
+        // Concrete sRGB sources decode on SRV sample and must re-encode via an sRGB RTV.
+        assert_eq!(
+            super::present_blit_rtv_format(
+                DXGI_FORMAT_R8G8B8A8_UNORM,
+                DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+            ),
+            DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+        );
+        assert_eq!(
+            super::present_blit_rtv_format(
+                DXGI_FORMAT_B8G8R8A8_UNORM,
+                DXGI_FORMAT_B8G8R8A8_UNORM_SRGB
+            ),
+            DXGI_FORMAT_B8G8R8A8_UNORM_SRGB
+        );
+        assert_eq!(
+            super::present_blit_rtv_format(
+                DXGI_FORMAT_B8G8R8A8_UNORM,
+                DXGI_FORMAT_B8G8R8X8_UNORM_SRGB
+            ),
+            DXGI_FORMAT_B8G8R8A8_UNORM_SRGB
+        );
+        // UNORM and TYPELESS sources pass through untouched via the UNORM RTV.
+        assert_eq!(
+            super::present_blit_rtv_format(DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8X8_UNORM),
+            DXGI_FORMAT_B8G8R8A8_UNORM
+        );
+        assert_eq!(
+            super::present_blit_rtv_format(
+                DXGI_FORMAT_R8G8B8A8_UNORM,
+                DXGI_FORMAT_R8G8B8A8_TYPELESS
+            ),
+            DXGI_FORMAT_R8G8B8A8_UNORM
+        );
     }
 }

@@ -879,7 +879,9 @@ impl State {
     }
 
     fn readonly_depth(&self, compute: bool) -> usize {
-        if !compute && self.depth != 0 && self.depth_flags & READ_ONLY_DEPTH != 0 {
+        let ro_depth = self.depth_flags & READ_ONLY_DEPTH != 0;
+        let ro_stencil = !self.depth_has_stencil || (self.depth_flags & READ_ONLY_STENCIL != 0);
+        if !compute && self.depth != 0 && ro_depth && ro_stencil {
             self.depth
         } else {
             0
@@ -1482,7 +1484,7 @@ const READ_ONLY_STENCIL: u32 = 0x2;
 fn depth_target_state(flags: u32, has_stencil: bool, sampled_as_srv: bool) -> u32 {
     let ro_depth = flags & READ_ONLY_DEPTH != 0;
     let ro_stencil = !has_stencil || (flags & READ_ONLY_STENCIL != 0);
-    if ro_depth && (ro_stencil || sampled_as_srv) {
+    if ro_depth && ro_stencil {
         if sampled_as_srv {
             DEPTH_READ | SHADER_RESOURCE
         } else {
@@ -1762,8 +1764,8 @@ mod tests {
             DEPTH_READ | SHADER_RESOURCE
         );
 
-        // Depth+stencil: both read-only stays in DEPTH_READ; depth-RO + stencil-write
-        // stays writable unless simultaneously sampled as depth SRV.
+        // Depth+stencil: both read-only stays in DEPTH_READ / DEPTH_READ|SRV;
+        // writable stencil requires DEPTH_WRITE even when depth is read-only.
         assert_eq!(
             depth_target_state(READ_ONLY_DEPTH | READ_ONLY_STENCIL, true, false),
             DEPTH_READ
@@ -1773,9 +1775,6 @@ mod tests {
             DEPTH_READ | SHADER_RESOURCE
         );
         assert_eq!(depth_target_state(READ_ONLY_DEPTH, true, false), DEPTH_WRITE);
-        assert_eq!(
-            depth_target_state(READ_ONLY_DEPTH, true, true),
-            DEPTH_READ | SHADER_RESOURCE
-        );
+        assert_eq!(depth_target_state(READ_ONLY_DEPTH, true, true), DEPTH_WRITE);
     }
 }
