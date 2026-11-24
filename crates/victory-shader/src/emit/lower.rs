@@ -7465,7 +7465,8 @@ impl<'a> Lower<'a> {
                     args.extend(&os[..2]);
                     args.push(self.s.m.i32(dmask.trailing_zeros()));
                     if op == 74 {
-                        let reference = self.as_float(addr_val(self, first - 1)?);
+                        let reference = addr_val(self, first - 1)?;
+                        let reference = self.as_float(reference);
                         args.push(reference);
                         self.s.op(
                             c,
