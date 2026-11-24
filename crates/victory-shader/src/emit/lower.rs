@@ -3544,10 +3544,22 @@ impl<'a> Lower<'a> {
                     0 => 1,
                     1 => 2,
                     2 => 4,
+                    3 if un.starts_with("image_sample")
+                        || un.starts_with("image_gather")
+                        || un == "image_get_resinfo" =>
+                    {
+                        5
+                    }
+                    3 => 7,
                     4 => 6,
                     5 => 7,
-                    _ => return Err("an image dimension (cube or MSAA)"),
+                    6 if matches!(un, "image_load" | "image_get_resinfo") => 3,
+                    7 if matches!(un, "image_load" | "image_get_resinfo") => 8,
+                    _ => return Err("an image dimension (MSAA)"),
                 };
+                if uav && matches!(kind, 3 | 8) {
+                    return Err("an MSAA UAV");
+                }
                 ((kind | u, 0x409), Some(kind))
             }
             Fields::Buffer { idxen, format, .. } => {
@@ -3582,7 +3594,7 @@ impl<'a> Lower<'a> {
         let c = self.cur;
         let i32t = self.s.t.i32;
         let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
-        let mip = if image.is_some() && !uav {
+        let mip = if image.is_some() && !uav && !matches!(image, Some(3 | 8)) {
             self.s.m.i32(0)
         } else {
             self.s.m.undef(i32t)
@@ -3597,11 +3609,16 @@ impl<'a> Lower<'a> {
                 let w = field(self, 0);
                 let (height, depth) = match kind {
                     1 => (one, one),
-                    2 => (field(self, 1), one),
+                    2 | 3 => (field(self, 1), one),
+                    5 => (field(self, 1), self.s.m.i32(6)),
                     6 => (one, field(self, 1)),
                     _ => (field(self, 1), field(self, 2)),
                 };
-                let levels = if uav { one } else { field(self, 3) };
+                let levels = if uav || matches!(kind, 3 | 8) {
+                    one
+                } else {
+                    field(self, 3)
+                };
                 let less = |l: &mut Self, x: V| l.s.m.bin(c, Bin::Sub, x, one);
                 let (w, height, depth, levels) = (
                     less(self, w),
@@ -3622,7 +3639,7 @@ impl<'a> Lower<'a> {
                 let hi = self.s.m.bin(c, Bin::And, hi, mask);
                 let ht = self.s.m.bin(c, Bin::Shl, height, k14);
                 let d2 = self.s.m.bin(c, Bin::Or, hi, ht);
-                let ty = [0, 8, 9, 0, 10, 0, 12, 13][kind as usize];
+                let ty = [0, 8, 9, 14, 10, 11, 12, 13, 15][kind as usize];
                 let base = k(self, 0xFAC | ty << 28);
                 let last = self.s.m.bin(c, Bin::Shl, levels, k16);
                 let d3 = self.s.m.bin(c, Bin::Or, base, last);
@@ -7185,10 +7202,17 @@ impl<'a> Lower<'a> {
                 (64, true)
             }
             "image_gather4"
+            | "image_gather4_o"
             | "image_gather4_lz"
             | "image_gather4_lz_o"
             | "image_gather4_l"
             | "image_gather4_l_o" => (73, true),
+            "image_gather4_c"
+            | "image_gather4_c_o"
+            | "image_gather4_c_lz"
+            | "image_gather4_c_lz_o"
+            | "image_gather4_c_l"
+            | "image_gather4_c_l_o" => (74, true),
             "image_load" | "image_load_mip" => (66, false),
             "image_get_resinfo" => (72, false),
             _ => return Err(name),
@@ -7241,7 +7265,7 @@ impl<'a> Lower<'a> {
                 .ok_or("an untracked sampler")?;
             // Comparison: the reference value is the first address after
             // the bias, and the sampler is a comparison sampler.
-            let cmp = matches!(op, 64 | 65);
+            let cmp = matches!(op, 64 | 65 | 74);
             if cmp && (*a16 || dmask.count_ones() != 1) {
                 return Err("a comparison sample of 16-bit coordinates or several channels");
             }
@@ -7323,7 +7347,7 @@ impl<'a> Lower<'a> {
             for o in os.iter_mut().take(offsets) {
                 *o = zero;
             }
-            if offset_word && op != 73 {
+            if offset_word && !matches!(op, 73 | 74) {
                 // DXIL takes immediate offsets in -8..=7; the console's are
                 // 6-bit signed and may be computed.
                 let w = addr_val(self, 0)?;
@@ -7425,9 +7449,6 @@ impl<'a> Lower<'a> {
                     )
                 }
                 _ => {
-                    if name == "image_gather4" {
-                        return Err("a gather with implicit level");
-                    }
                     if dmask.count_ones() != 1 {
                         return Err("a gather of several channels");
                     }
@@ -7443,14 +7464,27 @@ impl<'a> Lower<'a> {
                     }
                     args.extend(&os[..2]);
                     args.push(self.s.m.i32(dmask.trailing_zeros()));
-                    self.s.op(
-                        c,
-                        "textureGather.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        73,
-                        &args,
-                    )
+                    if op == 74 {
+                        let reference = self.as_float(addr_val(self, first - 1)?);
+                        args.push(reference);
+                        self.s.op(
+                            c,
+                            "textureGatherCmp.f32",
+                            Attr::ReadOnly,
+                            self.s.t.res_ret,
+                            74,
+                            &args,
+                        )
+                    } else {
+                        self.s.op(
+                            c,
+                            "textureGather.f32",
+                            Attr::ReadOnly,
+                            self.s.t.res_ret,
+                            73,
+                            &args,
+                        )
+                    }
                 }
             }
         } else {
@@ -7484,7 +7518,7 @@ impl<'a> Lower<'a> {
         let Operand::Vector { reg, .. } = *data else {
             return Err("an image result");
         };
-        let channels: Vec<u32> = if op == 73 {
+        let channels: Vec<u32> = if matches!(op, 73 | 74) {
             vec![0, 1, 2, 3]
         } else {
             (0..4).filter(|ch| dmask >> ch & 1 != 0).collect()
@@ -10076,6 +10110,83 @@ mod tests {
         ) {
             v.validate(&mut out.dxil.clone())
                 .expect("MSAA image_load/resinfo DXIL must pass dxil.dll validation");
+        }
+    }
+
+    #[test]
+    fn image_gather4_and_gather4_cmp_validate_as_dxil() {
+        let layout = vec![
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 2,
+                slot: 1,
+            },
+        ];
+        let used = vec![
+            UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 8,
+                user_data: 0,
+                slot: 0,
+            },
+            UsedResource {
+                kind: ResourceType::Sampler,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 2,
+                slot: 1,
+            },
+        ];
+        // Test implicit-level gather4, comparison gather4_c_lz, and
+        // programmable-offset comparison gather4_c_lz_o (PCF shadows).
+        for (w0, label) in [
+            (0xF100_0108u32, "image_gather4"),
+            (0xF13C_0108, "image_gather4_c_lz"),
+            (0xF17C_0108, "image_gather4_c_lz_o"),
+        ] {
+            let words = [
+                0xBE81_0380, // s_mov_b32 s1, 0
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xF40C_0100,
+                0xFA00_0000, // s_load_dwordx8 s[4:11], s[0:1], null
+                0xF408_0301,
+                0xFA00_0000, // s_load_dwordx4 s[12:15], s[2:3], null
+                0x7E00_0280, // v_mov_b32 v0, 0
+                0x7E02_0280, // v_mov_b32 v1, 0
+                0x7E04_0280, // v_mov_b32 v2, 0
+                0x7E06_0280, // v_mov_b32 v3, 0
+                w0,
+                0x0061_0400, // image_gather4* v[4:7], v[0..], s[4:11], s[12:15] dmask:0x1 dim:2D
+                S_ENDPGM,
+            ];
+            let out = lower_cs(&words, layout.clone(), used.clone())
+                .unwrap_or_else(|e| panic!("{label} should lower: {e}"));
+            assert!(!out.dxil.is_empty());
+            #[cfg(windows)]
+            if let Ok(mut v) = crate::emit::validator::Validator::load(
+                crate::emit::validator::Validator::default_path().as_deref(),
+            ) {
+                v.validate(&mut out.dxil.clone())
+                    .unwrap_or_else(|e| panic!("{label} DXIL failed validation: {e}"));
+            }
         }
     }
 }

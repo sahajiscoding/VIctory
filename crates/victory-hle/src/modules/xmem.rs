@@ -887,9 +887,73 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     true
 }
 
-/// Maps `slice` and the slices after it over `[base, base + len)`, which
-/// must lie in one placeholder.
+/// Win32 `MEM_COALESCE_PLACEHOLDERS` flag for `VirtualFree` (not exported by
+/// `windows-sys` 0.61).
+const MEM_COALESCE_PLACEHOLDERS: u32 = 0x0000_0001;
+
+/// Maps `slice` and the slices after it over `[base, base + len)`, even when
+/// `[base, base + len)` spans multiple adjacent placeholders (such as split
+/// regions left by earlier partial unmaps or neighboring placeholder
+/// allocations).
 fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
+    if len == 0 {
+        return true;
+    }
+    // Fast path: coalesce adjacent split placeholders inside `[base, base + len)`
+    // when they came from the same reservation so a single `MapViewOfFile3` can
+    // replace them (fails harmlessly when already one placeholder or spanning
+    // separate reservations).
+    // SAFETY: only operates on placeholder regions covering `[base, base + len)`.
+    unsafe {
+        VirtualFree(
+            base as *mut c_void,
+            len,
+            MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS,
+        );
+    }
+    let end = base + len;
+    let mut cur = base;
+    while cur < end {
+        // SAFETY: `MEMORY_BASIC_INFORMATION` is a plain Win32 POD struct.
+        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: `mbi` is valid and sized to `MEMORY_BASIC_INFORMATION`.
+        let queried = unsafe {
+            VirtualQueryEx(
+                GetCurrentProcess(),
+                cur as *const c_void,
+                &mut mbi,
+                size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        let chunk = if queried != 0 && mbi.RegionSize > 0 {
+            let region_end = (mbi.BaseAddress as usize).saturating_add(mbi.RegionSize);
+            let avail = region_end.saturating_sub(cur);
+            if avail >= PAGE {
+                (avail & !(PAGE - 1)).min(end - cur)
+            } else {
+                end - cur
+            }
+        } else {
+            end - cur
+        };
+        let sub_slice = Slice {
+            index: slice.index + (cur - base) / PAGE,
+            section: slice.section.clone(),
+        };
+        if !map_single(physical, cur, chunk, sub_slice) {
+            if cur > base {
+                unmap(physical, base, cur - base);
+            }
+            return false;
+        }
+        cur += chunk;
+    }
+    true
+}
+
+/// Maps `slice` and the slices after it over `[base, base + len)`, which
+/// lies within a single host placeholder.
+fn map_single(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     // SAFETY: splits the placeholder around the range (failing harmlessly
     // when the range is the whole placeholder), then maps the section
     // there; both act only on placeholders.
@@ -1482,6 +1546,52 @@ mod tests {
             let expected = (idx as u8).wrapping_add(0x41);
             assert!(page_bytes(page).iter().all(|&b| b == expected));
         }
+        assert_eq!(XMemFreePhysicalPages(pages.len(), pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn mapping_spans_previously_split_placeholders() {
+        let pages = allocate(4);
+        let base = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            4 * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!base.is_null());
+        let at = |i: usize| base.wrapping_byte_add(i * PAGE);
+
+        // Map all 4 pages, then unmap page 1, page 0, and pages 2..4 in separate
+        // steps so the reservation is fractured into 3 adjacent placeholders:
+        // [0..1), [1..2), [2..4).
+        assert_eq!(XMemMapPhysicalPages(base, 4, pages.as_ptr()), base);
+        assert_eq!(XMemMapPhysicalPages(at(1), 1, std::ptr::null()), at(1));
+        assert_eq!(XMemMapPhysicalPages(at(0), 1, std::ptr::null()), at(0));
+        assert_eq!(XMemMapPhysicalPages(at(2), 2, std::ptr::null()), at(2));
+
+        // Mapping a 2-page slice starting across the [0..1)/[1..2) split
+        // and ending inside [2..4) exercises partial multi-placeholder mapping.
+        assert_eq!(XMemMapPhysicalPages(at(1), 2, pages[1..].as_ptr()), at(1));
+        for i in 1..=2 {
+            assert_eq!(query(at(i)).host.State, MEM_COMMIT);
+            // SAFETY: pages 1 and 2 are mapped read-write.
+            unsafe { at(i).cast::<u8>().write(0x20 + i as u8) };
+        }
+
+        // Unmap the middle again, then map all 4 contiguous pages across all
+        // split placeholders at once.
+        assert_eq!(XMemMapPhysicalPages(at(1), 2, std::ptr::null()), at(1));
+        assert_eq!(XMemMapPhysicalPages(base, 4, pages.as_ptr()), base);
+        for i in 0..4 {
+            assert_eq!(query(at(i)).host.State, MEM_COMMIT);
+            // SAFETY: all 4 pages are mapped read-write.
+            unsafe { at(i).cast::<u8>().write(0xA0 + i as u8) };
+            // SAFETY: just written above.
+            assert_eq!(unsafe { at(i).cast::<u8>().read() }, 0xA0 + i as u8);
+        }
+
+        assert_eq!(XMemMapPhysicalPages(base, 4, std::ptr::null()), base);
         assert_eq!(XMemFreePhysicalPages(pages.len(), pages.as_ptr()), 1);
     }
 }
