@@ -9961,8 +9961,10 @@ mod tests {
         .expect("bounds-clamped LDS ops should lower");
         assert!(!out.dxil.is_empty());
         #[cfg(windows)]
-        if let Some(v) = crate::emit::validator::Validator::load() {
-            v.validate(&out.dxil)
+        if let Ok(mut v) = crate::emit::validator::Validator::load(
+            crate::emit::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut out.dxil.clone())
                 .expect("bounds-clamped LDS DXIL must pass dxil.dll validation");
         }
     }
@@ -10024,8 +10026,10 @@ mod tests {
                 .expect("cube image_store and image_store_mip should lower");
             assert!(!out.dxil.is_empty());
             #[cfg(windows)]
-            if let Some(v) = crate::emit::validator::Validator::load() {
-                v.validate(&out.dxil)
+            if let Ok(mut v) = crate::emit::validator::Validator::load(
+                crate::emit::validator::Validator::default_path().as_deref(),
+            ) {
+                v.validate(&mut out.dxil.clone())
                     .expect("cube/mip image_store DXIL must pass dxil.dll validation");
             }
         }
@@ -10067,8 +10071,10 @@ mod tests {
         let out = lower_cs(&words, layout, used).expect("MSAA image_load and resinfo should lower");
         assert!(!out.dxil.is_empty());
         #[cfg(windows)]
-        if let Some(v) = crate::emit::validator::Validator::load() {
-            v.validate(&out.dxil)
+        if let Ok(mut v) = crate::emit::validator::Validator::load(
+            crate::emit::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut out.dxil.clone())
                 .expect("MSAA image_load/resinfo DXIL must pass dxil.dll validation");
         }
     }
