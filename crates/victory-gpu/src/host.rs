@@ -2260,6 +2260,8 @@ fn present_srv_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
         29 => DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
         87 | 90 => DXGI_FORMAT_B8G8R8A8_UNORM,
         91 => DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
+        88 | 92 => DXGI_FORMAT_B8G8R8X8_UNORM,
+        93 => DXGI_FORMAT_B8G8R8X8_UNORM_SRGB,
         23 | 24 => DXGI_FORMAT_R10G10B10A2_UNORM,
         9 | 10 => DXGI_FORMAT_R16G16B16A16_FLOAT,
         _ => return None,
@@ -2455,7 +2457,7 @@ float4 ps(VSOut i) : SV_Target {
 fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
     Some(match format.0 {
         27..=32 => DXGI_FORMAT_R8G8B8A8_UNORM,
-        87 | 90 | 91 => DXGI_FORMAT_B8G8R8A8_UNORM,
+        87 | 88 | 90..=93 => DXGI_FORMAT_B8G8R8A8_UNORM,
         23..=25 => DXGI_FORMAT_R10G10B10A2_UNORM,
         9..=14 => DXGI_FORMAT_R16G16B16A16_FLOAT,
         _ => return None,

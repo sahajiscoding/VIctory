@@ -54,7 +54,14 @@ unsafe impl Send for Library {}
 const LIBRARY_FILE: &str = "host-pipelines.bin";
 const EARLY_FILE: &str = "early-pipelines.txt";
 /// Title pipelines listed for an early start, at most.
-const EARLY_MAX: usize = 8192;
+const EARLY_MAX: usize = 16384;
+/// Minimum interval between background saves when the worker queue is quiet.
+const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
+/// Longer save interval while a heavy world-load compilation burst is running
+/// so `Serialize` does not contend with worker PSO loads/stores.
+const SAVE_BURST_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+/// Queue depth above which background saves are deferred to [`SAVE_BURST_EVERY`].
+const SAVE_BURST_QUEUE: u64 = 8;
 
 fn library() -> Option<&'static Mutex<Library>> {
     static LIBRARY: OnceLock<Option<Mutex<Library>>> = OnceLock::new();
@@ -149,15 +156,76 @@ pub(crate) fn pipeline(
     Ok(pso)
 }
 
+/// Required elapsed interval before triggering a background save, given the
+/// number of pipelines currently waiting in the worker queue.
+fn save_interval(waiting: u64) -> std::time::Duration {
+    if waiting > SAVE_BURST_QUEUE {
+        SAVE_BURST_EVERY
+    } else {
+        SAVE_EVERY
+    }
+}
+
+/// Schedules a non-blocking background save of the pipeline library and early
+/// list on a dedicated low-priority thread so compilation workers never stall
+/// on serialization or disk I/O.
+pub(crate) fn schedule_save() {
+    static LAST_SCHEDULED: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    static SAVER: OnceLock<Option<std::sync::mpsc::SyncSender<()>>> = OnceLock::new();
+    if DIR.get().is_none() || library().is_none() {
+        return;
+    }
+    let interval = save_interval(super::make::waiting());
+    {
+        let mut last = LAST_SCHEDULED.lock().unwrap_or_else(|e| e.into_inner());
+        if last.is_some_and(|t| t.elapsed() < interval) {
+            return;
+        }
+        *last = Some(std::time::Instant::now());
+    }
+    let sender = SAVER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
+        match std::thread::Builder::new()
+            .name("victory-pipeline-save".into())
+            .spawn(move || {
+                // SAFETY: a plain call on our own thread.
+                unsafe {
+                    use windows::Win32::System::Threading::*;
+                    let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+                }
+                while rx.recv().is_ok() {
+                    save_inner(false);
+                }
+            }) {
+            Ok(_) => Some(tx),
+            Err(e) => {
+                tracing::warn!(error = %e, "no pipeline cache saver thread");
+                None
+            }
+        }
+    });
+    if let Some(tx) = sender {
+        // Coalesce overlapping triggers without blocking the compiler worker.
+        let _ = tx.try_send(());
+    }
+}
+
 /// Writes the library and the early list if pipelines were added since the
-/// last save and `SAVE_EVERY` has passed (or `now`).
+/// last save and the interval has passed (or immediately when `now` is true,
+/// e.g. on process shutdown).
 pub(crate) fn save(now: bool) {
+    save_inner(now);
+}
+
+fn save_inner(now: bool) {
+    static SAVE_LOCK: Mutex<()> = Mutex::new(());
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
-    const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
+    let _guard = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let interval = save_interval(super::make::waiting());
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-        if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
+        if !now && last.is_some_and(|t| t.elapsed() < interval) {
             return;
         }
         *last = Some(std::time::Instant::now());
@@ -183,7 +251,13 @@ pub(crate) fn save(now: bool) {
             }
         }
     };
-    let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
+    let used: Vec<String> = USED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .flatten()
+        .cloned()
+        .collect();
     let written = std::fs::create_dir_all(dir)
         .and_then(|()| write_atomically(&dir.join(LIBRARY_FILE), &blob))
         .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
@@ -200,12 +274,26 @@ pub(crate) fn save(now: bool) {
     }
 }
 
-/// Writes `bytes` to a temporary file beside `path`, then renames it over
-/// `path`: a reader never sees a part.
+/// Writes `bytes` to a unique temporary file beside `path`, then renames it
+/// over `path`: a reader never sees a partial file and overlapping writers
+/// never collide on the same temp path.
 fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path)
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("cache");
+    let tmp = path.with_file_name(format!("{name}.{}.{seq}.tmp", std::process::id()));
+    if let Err(e) = std::fs::write(&tmp, bytes) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// Title pipeline keys drawn or dispatched with (this run and the last).
@@ -265,5 +353,25 @@ mod tests {
         // SAFETY: a plain query on a live library.
         assert!(unsafe { library.library.GetSerializedSize() } > 0);
         assert!(library._blob.is_empty());
+    }
+
+    #[test]
+    fn save_interval_defers_during_compilation_bursts() {
+        assert_eq!(save_interval(0), SAVE_EVERY);
+        assert_eq!(save_interval(SAVE_BURST_QUEUE), SAVE_EVERY);
+        assert_eq!(save_interval(SAVE_BURST_QUEUE + 1), SAVE_BURST_EVERY);
+        assert!(SAVE_BURST_EVERY > SAVE_EVERY);
+    }
+
+    #[test]
+    fn write_atomically_replaces_existing_file_cleanly() {
+        let dir = std::env::temp_dir().join(format!("victory-lib-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cache.bin");
+        write_atomically(&path, b"first").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"first");
+        write_atomically(&path, b"second-payload").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"second-payload");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -221,8 +221,15 @@ pub(crate) fn save_read_back(
 ) {
     let f = footprint.Footprint;
     let bgra = match f.Format {
-        DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB => false,
-        DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB => true,
+        DXGI_FORMAT_R8G8B8A8_TYPELESS
+        | DXGI_FORMAT_R8G8B8A8_UNORM
+        | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB => false,
+        DXGI_FORMAT_B8G8R8A8_TYPELESS
+        | DXGI_FORMAT_B8G8R8A8_UNORM
+        | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB
+        | DXGI_FORMAT_B8G8R8X8_TYPELESS
+        | DXGI_FORMAT_B8G8R8X8_UNORM
+        | DXGI_FORMAT_B8G8R8X8_UNORM_SRGB => true,
         other => {
             tracing::warn!(format = other.0, "frame not saved: not 8-bit color");
             return;

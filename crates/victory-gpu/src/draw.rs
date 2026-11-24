@@ -65,6 +65,14 @@ pub(crate) struct State {
     /// Bound render target and depth resources, for their host states.
     targets: Vec<usize>,
     depth: usize,
+    /// `D3D12_DSV_FLAGS` (`0x1` read-only depth, `0x2` read-only stencil) of
+    /// the bound depth view.
+    depth_flags: u32,
+    /// Whether the bound depth view's format includes a stencil plane.
+    depth_has_stencil: bool,
+    /// Set during [`Self::bind`] if the current graphics draw also binds
+    /// [`Self::depth`] as a shader resource view.
+    depth_sampled: bool,
     /// The title's primitive topology (the host's may differ).
     topology: u32,
     /// What the host list has: pipeline, root signature, heaps.
@@ -317,12 +325,25 @@ impl State {
             rtvs.push(host.rtv(texture, record.desc().as_ref()));
         }
         self.depth = 0;
+        self.depth_flags = 0;
+        self.depth_has_stencil = false;
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
             let texture = crate::resource::host_resource(record.resource)?;
             self.depth = record.resource as usize;
+            let desc = record.depth_desc();
+            self.depth_flags = desc.as_ref().map_or(0, |d| d.Flags.0 as u32);
+            let fmt = desc
+                .as_ref()
+                .map(|d| d.Format.0 as u32)
+                .filter(|&f| f != 0)
+                .unwrap_or_else(|| {
+                    // SAFETY: a live texture.
+                    unsafe { texture.GetDesc() }.Format.0 as u32
+                });
+            self.depth_has_stencil = matches!(fmt, 19 | 20 | 44 | 45);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            Some(host.dsv(texture, record.depth_desc().as_ref()))
+            Some(host.dsv(texture, desc.as_ref()))
         });
         // SAFETY: an open list; the views were just made.
         unsafe {
@@ -485,12 +506,16 @@ impl State {
             unsafe { l.IASetIndexBuffer(Some(&view)) };
         }
         const RENDER_TARGET: u32 = 0x4;
-        const DEPTH_WRITE: u32 = 0x10;
         for &t in &self.targets {
             crate::list::ensure_state(list, t as This, RENDER_TARGET);
         }
         if self.depth != 0 {
-            crate::list::ensure_state(list, self.depth as This, DEPTH_WRITE);
+            let state = depth_target_state(
+                self.depth_flags,
+                self.depth_has_stencil,
+                self.depth_sampled,
+            );
+            crate::list::ensure_state(list, self.depth as This, state);
         }
         true
     }
@@ -532,6 +557,7 @@ impl State {
     /// not transition them away from `UNORDERED_ACCESS`, or `None` if a
     /// required fresh table could not be made and the draw/dispatch must drop.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> Option<Vec<usize>> {
+        self.depth_sampled = false;
         let mut uav_buffers = Vec::new();
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
@@ -852,8 +878,16 @@ impl State {
         }
     }
 
+    fn readonly_depth(&self, compute: bool) -> usize {
+        if !compute && self.depth != 0 && self.depth_flags & READ_ONLY_DEPTH != 0 {
+            self.depth
+        } else {
+            0
+        }
+    }
+
     fn table_entry(
-        &self,
+        &mut self,
         list: &HostList,
         u: &UsedResource,
         compute: bool,
@@ -869,8 +903,11 @@ impl State {
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
             return;
         };
-        if let Some(view) = host.mirror_for(index, handle, true, u.kind, u.dwords) {
-            readable(list, u, &view, uav_buffers);
+        let ro_depth = self.readonly_depth(compute);
+        if let Some(view) = host.mirror_for(index, handle, true, u.kind, u.dwords)
+            && readable(list, u, &view, uav_buffers, ro_depth)
+        {
+            self.depth_sampled = true;
         }
     }
 
@@ -987,11 +1024,14 @@ impl State {
                 }
                 (table, h.finish())
             };
+            let ro_depth = self.readonly_depth(compute);
             if let Some(&table_base) = self.fresh_tables.get(&key) {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
-                    if let Some(view) = crate::descriptor::view(handle) {
-                        readable(list, u, &view, uav_buffers);
+                    if let Some(view) = crate::descriptor::view(handle)
+                        && readable(list, u, &view, uav_buffers, ro_depth)
+                    {
+                        self.depth_sampled = true;
                     }
                 }
                 made.push((slot, table_base * 32));
@@ -1054,8 +1094,10 @@ impl State {
                     }
                     Some(view) => {
                         host.make_at(index, &view);
-                        if let Some(u) = used {
-                            readable(list, u, &view, uav_buffers);
+                        if let Some(u) = used
+                            && readable(list, u, &view, uav_buffers, ro_depth)
+                        {
+                            self.depth_sampled = true;
                         }
                     }
                     None => {
@@ -1425,10 +1467,43 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
     Some(signature)
 }
 
+const DEPTH_WRITE: u32 = 0x10;
+const DEPTH_READ: u32 = 0x20;
+const SHADER_RESOURCE: u32 = 0x40 | 0x80;
+const READ_ONLY_DEPTH: u32 = 0x1;
+const READ_ONLY_STENCIL: u32 = 0x2;
+
+/// Host D3D12 resource state required for a bound depth-stencil target.
+///
+/// Read-only DSVs stay in `DEPTH_READ` (combined with shader-resource read
+/// bits when simultaneously sampled as an SRV in deferred lighting, decal, or
+/// atmosphere passes) instead of clobbering the depth surface into
+/// `DEPTH_WRITE`.
+fn depth_target_state(flags: u32, has_stencil: bool, sampled_as_srv: bool) -> u32 {
+    let ro_depth = flags & READ_ONLY_DEPTH != 0;
+    let ro_stencil = !has_stencil || (flags & READ_ONLY_STENCIL != 0);
+    if ro_depth && (ro_stencil || sampled_as_srv) {
+        if sampled_as_srv {
+            DEPTH_READ | SHADER_RESOURCE
+        } else {
+            DEPTH_READ
+        }
+    } else {
+        DEPTH_WRITE
+    }
+}
+
 /// Gets what a shader reads or writes through a view ready: buffer data
-/// copied, textures and buffers moved to the state they need.
-fn readable(list: &HostList, u: &UsedResource, view: &View, uav_buffers: &mut Vec<usize>) {
-    const SHADER_RESOURCE: u32 = 0x40 | 0x80;
+/// copied, textures and buffers moved to the state they need. Returns `true`
+/// if `readonly_depth` was simultaneously bound as an SRV so the caller keeps
+/// it in `DEPTH_READ | SHADER_RESOURCE`.
+fn readable(
+    list: &HostList,
+    u: &UsedResource,
+    view: &View,
+    uav_buffers: &mut Vec<usize>,
+    readonly_depth: usize,
+) -> bool {
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
@@ -1457,7 +1532,13 @@ fn readable(list: &HostList, u: &UsedResource, view: &View, uav_buffers: &mut Ve
             {
                 crate::texture::upload(list, *resource as This, t);
             }
-            crate::list::ensure_state(list, *resource as This, SHADER_RESOURCE);
+            let sampled_depth = readonly_depth != 0 && *resource == readonly_depth;
+            let wanted = if sampled_depth {
+                DEPTH_READ | SHADER_RESOURCE
+            } else {
+                SHADER_RESOURCE
+            };
+            crate::list::ensure_state(list, *resource as This, wanted);
             #[cfg(feature = "diagnostics")]
             if let Some(t) = crate::resource::host_resource(*resource as This) {
                 // SAFETY: a live resource.
@@ -1470,14 +1551,16 @@ fn readable(list: &HostList, u: &UsedResource, view: &View, uav_buffers: &mut Ve
                     );
                 }
             }
+            sampled_depth
         }
         (View::Unordered(resource, _, _), ResourceType::Uav) => {
             crate::texture::host_written(*resource as This);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(*resource as This);
             crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
+            false
         }
-        _ => {}
+        _ => false,
     }
 }
 
@@ -1612,7 +1695,10 @@ fn rect_vertex_range(
 
 #[cfg(test)]
 mod tests {
-    use super::{fresh_table_span, rect_vertex_range};
+    use super::{
+        DEPTH_READ, DEPTH_WRITE, READ_ONLY_DEPTH, READ_ONLY_STENCIL, SHADER_RESOURCE,
+        depth_target_state, fresh_table_span, rect_vertex_range,
+    };
     use victory_shader::{ResourceType, RootType, UsedResource};
 
     fn used_table_entry(offset_dwords: u32) -> UsedResource {
@@ -1660,5 +1746,36 @@ mod tests {
         assert_eq!(rect_vertex_range(0x1000, 47, 16, 0, 3), None);
         // Expanded triangle buffer would exceed u32 `SizeInBytes`.
         assert_eq!(rect_vertex_range(0x1000, u32::MAX, 16, 0, (1 << 28) - 1), None);
+    }
+
+    #[test]
+    fn depth_target_state_preserves_read_only_and_srv_reads() {
+        // Writable DSV always needs DEPTH_WRITE.
+        assert_eq!(depth_target_state(0, false, false), DEPTH_WRITE);
+        assert_eq!(depth_target_state(0, true, false), DEPTH_WRITE);
+        assert_eq!(depth_target_state(0, false, true), DEPTH_WRITE);
+
+        // Depth-only read-only DSV stays in DEPTH_READ (or DEPTH_READ|SRV when sampled).
+        assert_eq!(depth_target_state(READ_ONLY_DEPTH, false, false), DEPTH_READ);
+        assert_eq!(
+            depth_target_state(READ_ONLY_DEPTH, false, true),
+            DEPTH_READ | SHADER_RESOURCE
+        );
+
+        // Depth+stencil: both read-only stays in DEPTH_READ; depth-RO + stencil-write
+        // stays writable unless simultaneously sampled as depth SRV.
+        assert_eq!(
+            depth_target_state(READ_ONLY_DEPTH | READ_ONLY_STENCIL, true, false),
+            DEPTH_READ
+        );
+        assert_eq!(
+            depth_target_state(READ_ONLY_DEPTH | READ_ONLY_STENCIL, true, true),
+            DEPTH_READ | SHADER_RESOURCE
+        );
+        assert_eq!(depth_target_state(READ_ONLY_DEPTH, true, false), DEPTH_WRITE);
+        assert_eq!(
+            depth_target_state(READ_ONLY_DEPTH, true, true),
+            DEPTH_READ | SHADER_RESOURCE
+        );
     }
 }

@@ -2463,16 +2463,22 @@ impl<'a> Lower<'a> {
             return Err("LDS the program does not allocate");
         }
         let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
-        // shortcut: LDS addresses are taken as dword-aligned and in bounds
-        // (out-of-bounds console accesses read 0 and drop writes).
-        let dword = |l: &mut Self, bytes: u32| -> V {
+        // Console LDS accesses out of range read 0 and drop writes. Clamp the
+        // TGSM element index and guard writes/atomics against `lds_dwords` so
+        // dynamic or divergent addresses never trigger DXIL TGSM undefined
+        // behavior or GPU hangs.
+        let dword_checked = |l: &mut Self, bytes: u32| -> (V, V) {
             let c = l.cur;
             let o = l.s.m.i32(bytes);
             let at = l.s.m.bin(c, Bin::Add, a, o);
             let two = l.s.m.i32(2);
             let index = l.s.m.bin(c, Bin::LShr, at, two);
+            let limit = l.s.m.i32(l.s.lds_dwords);
+            let in_bounds = l.s.m.cmp(c, pred::IULT, index, limit);
+            let zero = l.s.m.i32(0);
+            let safe_index = l.s.m.select(c, in_bounds, index, zero);
             let lds = l.s.lds();
-            l.s.m.element(c, lds, index)
+            (l.s.m.element(c, lds, safe_index), in_bounds)
         };
         let width = |n: &str| match n.rsplit('_').next() {
             Some("b64") => 2,
@@ -2510,13 +2516,17 @@ impl<'a> Lower<'a> {
                 let byte_addr = self.s.m.bin(c, Bin::Add, a, o);
                 let two = self.s.m.i32(2);
                 let index = self.s.m.bin(c, Bin::LShr, byte_addr, two);
+                let limit = self.s.m.i32(self.s.lds_dwords);
+                let in_bounds = self.s.m.cmp(c, pred::IULT, index, limit);
+                let zero = self.s.m.i32(0);
+                let safe_index = self.s.m.select(c, in_bounds, index, zero);
                 let lds = self.s.lds();
-                let p = self.s.m.element(c, lds, index);
+                let p = self.s.m.element(c, lds, safe_index);
                 let w = self.s.m.load(c, p);
                 let three = self.s.m.i32(3);
                 let lane_byte = self.s.m.bin(c, Bin::And, byte_addr, three);
                 let shift = self.s.m.bin(c, Bin::Shl, lane_byte, three);
-                let x = if signed {
+                let extracted = if signed {
                     let top = self.s.m.i32(32 - width_bits);
                     let shl = self.s.m.bin(c, Bin::Sub, top, shift);
                     let hi = self.s.m.bin(c, Bin::Shl, w, shl);
@@ -2526,6 +2536,7 @@ impl<'a> Lower<'a> {
                     let mask = self.s.m.i32((1u32 << width_bits) - 1);
                     self.s.m.bin(c, Bin::And, shifted, mask)
                 };
+                let x = self.s.m.select(c, in_bounds, extracted, zero);
                 self.write(inst, Reg::V(reg), x, guard);
                 return Ok(());
             }
@@ -2537,10 +2548,12 @@ impl<'a> Lower<'a> {
                 return Err("an LDS read of bytes or halves");
             };
             let mut n = 0;
+            let zero = self.s.m.i32(0);
             for (off, w) in elements {
                 for k in 0..w {
-                    let p = dword(self, off + 4 * k);
-                    let x = self.s.m.load(self.cur, p);
+                    let (p, in_bounds) = dword_checked(self, off + 4 * k);
+                    let raw = self.s.m.load(self.cur, p);
+                    let x = self.s.m.select(self.cur, in_bounds, raw, zero);
                     self.write(inst, Reg::V(reg + n), x, guard);
                     n += 1;
                 }
@@ -2568,8 +2581,12 @@ impl<'a> Lower<'a> {
                 let byte_addr = self.s.m.bin(c, Bin::Add, a, o);
                 let two = self.s.m.i32(2);
                 let index = self.s.m.bin(c, Bin::LShr, byte_addr, two);
+                let limit = self.s.m.i32(self.s.lds_dwords);
+                let in_bounds = self.s.m.cmp(c, pred::IULT, index, limit);
+                let zero = self.s.m.i32(0);
+                let safe_index = self.s.m.select(c, in_bounds, index, zero);
                 let lds = self.s.lds();
-                let p = self.s.m.element(c, lds, index);
+                let p = self.s.m.element(c, lds, safe_index);
                 let three = self.s.m.i32(3);
                 let lane_byte = self.s.m.bin(c, Bin::And, byte_addr, three);
                 let shift = self.s.m.bin(c, Bin::Shl, lane_byte, three);
@@ -2579,7 +2596,8 @@ impl<'a> Lower<'a> {
                 let bits = self.s.m.bin(c, Bin::Shl, val, shift);
                 // Atomic mask-and-insert avoids racing against sibling lanes
                 // writing other bytes or halves of the same LDS dword.
-                let at = self.begin_guarded(guard);
+                let eff_guard = self.and_guard(guard, in_bounds);
+                let at = self.begin_guarded(eff_guard);
                 self.s.m.atomic(self.cur, Rmw::And, p, clear_mask);
                 self.s.m.atomic(self.cur, Rmw::Or, p, bits);
                 self.end_guarded(at, &[]);
@@ -2599,12 +2617,23 @@ impl<'a> Lower<'a> {
                     stores.push((off + 4 * k as u32, x));
                 }
             }
-            let at = self.begin_guarded(guard);
-            for (off, x) in stores {
-                let p = dword(self, off);
+            if stores.len() == 1 {
+                let (off, x) = stores[0];
+                let (p, in_bounds) = dword_checked(self, off);
+                let eff_guard = self.and_guard(guard, in_bounds);
+                let at = self.begin_guarded(eff_guard);
                 self.s.m.store(self.cur, p, x);
+                self.end_guarded(at, &[]);
+            } else {
+                let at = self.begin_guarded(guard);
+                for (off, x) in stores {
+                    let (p, in_bounds) = dword_checked(self, off);
+                    let inner = self.begin_guarded(Some(in_bounds));
+                    self.s.m.store(self.cur, p, x);
+                    self.end_guarded(inner, &[]);
+                }
+                self.end_guarded(at, &[]);
             }
-            self.end_guarded(at, &[]);
             return Ok(());
         }
         // Atomics: the old value returns with `_rtn`.
@@ -2619,8 +2648,14 @@ impl<'a> Lower<'a> {
                 Some((_, v)) => self.i32_of(v).unwrap_or(self.s.m.i32(0)),
                 None => self.s.m.i32(0),
             };
-            let p = dword(self, offset);
-            let at = self.begin_guarded(guard);
+            let (p, in_bounds) = dword_checked(self, offset);
+            let zero = self.s.m.i32(0);
+            let oob_outside = match guard {
+                Some(g) => self.s.m.select(self.cur, g, zero, outside),
+                None => zero,
+            };
+            let eff_guard = self.and_guard(guard, in_bounds);
+            let at = self.begin_guarded(eff_guard);
             let enter = self.cur;
             let init = self.s.m.load(enter, p);
             let loop_bb = self.s.m.new_block();
@@ -2638,7 +2673,7 @@ impl<'a> Lower<'a> {
             self.s.m.terminate(loop_bb, Term::CondBr(eq, done_bb, loop_bb));
             self.s.m.set_phi(cur_i, vec![(init, enter), (prev_i, loop_bb)]);
             self.cur = done_bb;
-            let r = self.end_guarded(at, &[(prev_i, outside)])[0];
+            let r = self.end_guarded(at, &[(prev_i, oob_outside)])[0];
             if let Some(reg) = dst_reg {
                 self.write(inst, Reg::V(reg), r, None);
             }
@@ -2669,8 +2704,14 @@ impl<'a> Lower<'a> {
             Some((_, v)) => self.i32_of(v).unwrap_or(self.s.m.i32(0)),
             None => self.s.m.i32(0),
         };
-        let p = dword(self, offset);
-        let at = self.begin_guarded(guard);
+        let (p, in_bounds) = dword_checked(self, offset);
+        let zero = self.s.m.i32(0);
+        let oob_outside = match guard {
+            Some(g) => self.s.m.select(self.cur, g, zero, outside),
+            None => zero,
+        };
+        let eff_guard = self.and_guard(guard, in_bounds);
+        let at = self.begin_guarded(eff_guard);
         let r = match rmw {
             Some(op) => self.s.m.atomic(self.cur, op, p, v0),
             // Compare with data0, store data1.
@@ -2679,7 +2720,7 @@ impl<'a> Lower<'a> {
                 .m
                 .cmpxchg(self.cur, p, v0, v1.ok_or("an LDS compare")?),
         };
-        let r = self.end_guarded(at, &[(r, outside)])[0];
+        let r = self.end_guarded(at, &[(r, oob_outside)])[0];
         if let Some(reg) = dst_reg {
             self.write(inst, Reg::V(reg), r, None);
         }
@@ -6852,9 +6893,15 @@ impl<'a> Lower<'a> {
             {
                 (5, 3)
             }
+            // Cube loads, stores, and atomics address `(x, y, face)` integer
+            // texels, matching a 2D array (`Texture2DArray`) in DXIL.
+            3 => (7, 3),
             4 => (6, 2),
             5 => (7, 3),
-            _ => return Err("an image dimension (cube loads or MSAA)"),
+            // MSAA loads and dimension queries (`Texture2DMS` / `Texture2DMSArray`).
+            6 if matches!(name, "image_load" | "image_get_resinfo") => (3, 2),
+            7 if matches!(name, "image_load" | "image_get_resinfo") => (8, 3),
+            _ => return Err("an image dimension (MSAA)"),
         };
         // Address VGPRs in order.
         let mut regs = Vec::new();
@@ -6888,6 +6935,9 @@ impl<'a> Lower<'a> {
             || self
                 .used_kind(src)
                 .is_some_and(|u| u.kind == ResourceType::Uav);
+        if uav && matches!(kind, 3 | 8) {
+            return Err("an MSAA UAV");
+        }
         let props = (kind | if uav { 0x1000 } else { 0 }, 0x409);
         if let Some(op) = name.strip_prefix("image_atomic_") {
             // DXIL's atomic operations on a 32-bit integer texture UAV; the
@@ -7042,8 +7092,8 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         if store {
-            if name != "image_store" {
-                return Err("an image store to a mip level");
+            if !matches!(name, "image_store" | "image_store_mip") {
+                return Err("a packed image store");
             }
             if *dmask == 0 {
                 return Ok(());
@@ -7144,11 +7194,11 @@ impl<'a> Lower<'a> {
             _ => return Err(name),
         };
         if op == 72 {
-            // Width, height, depth or layers, levels (per dmask) of the level
-            // in the first address: DXIL's dimensions; a channel DXIL leaves
-            // out reads 1 (UAVs: one level).
+            // Width, height, depth or layers, levels (or sample count for MSAA)
+            // per dmask of the level in the first address: DXIL's dimensions;
+            // a channel DXIL leaves out reads 1 (UAVs: one level; MSAA: undef mip).
             let h = self.handle(site, src, false, props)?;
-            let mip = if uav {
+            let mip = if uav || matches!(kind, 3 | 8) {
                 self.s.m.undef(self.s.t.i32)
             } else {
                 addr_val(self, 0)?
@@ -7161,7 +7211,7 @@ impl<'a> Lower<'a> {
             let one = self.s.m.i32(1);
             let present = match kind {
                 1 => [true, false, false, true],
-                2 | 5 | 6 => [true, true, false, true],
+                2 | 3 | 5 | 6 => [true, true, false, true],
                 _ => [true, true, true, true],
             };
             let Operand::Vector { reg, .. } = *data else {
@@ -7408,7 +7458,9 @@ impl<'a> Lower<'a> {
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
                 *slot = addr_val(self, k)?;
             }
-            let mip = if name == "image_load_mip" {
+            let mip = if matches!(kind, 3 | 8) || name == "image_load_mip" {
+                // MSAA sample index (`fragid`) or explicit mip level follows
+                // the spatial/array coordinates.
                 addr_val(self, coords)?
             } else if uav {
                 // Our declarations have four channels.
@@ -9849,5 +9901,175 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    #[test]
+    fn lds_bounds_clamped_ops_validate_as_dxil() {
+        // Exercises bounds-clamped ds_write_b32, ds_read_b32, ds_write_b64,
+        // ds_read_b64, ds_write_b8, ds_read_u8, ds_add_rtn_u32, and ds_max_f32.
+        let words = [
+            0x7E00_0280, // v_mov_b32 v0, 0
+            0x7E02_0281, // v_mov_b32 v1, 1
+            0x7E04_0282, // v_mov_b32 v2, 2
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            0xD8D8_0000,
+            0x0300_0000, // ds_read_b32 v3, v0
+            0xD934_0000,
+            0x0000_0100, // ds_write_b64 v0, v[1:2]
+            0xD9D8_0000,
+            0x0400_0000, // ds_read_b64 v[4:5], v0
+            0xD878_0000,
+            0x0000_0100, // ds_write_b8 v0, v1
+            0xD8E8_0000,
+            0x0600_0000, // ds_read_u8 v6, v0
+            0xD880_0000,
+            0x0700_0100, // ds_add_rtn_u32 v7, v0, v1
+            0xD84C_0000,
+            0x0000_0100, // ds_max_f32 v0, v1
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 256,
+            layout: Vec::new(),
+            used: Vec::new(),
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 15, // 512 bytes (128 dwords) of LDS
+                threads: [1, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, false, 256).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let out = lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            res: &res,
+            io: &io,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+            max_wave_size: 64,
+        })
+        .expect("bounds-clamped LDS ops should lower");
+        assert!(!out.dxil.is_empty());
+        #[cfg(windows)]
+        if let Some(v) = crate::emit::validator::Validator::load() {
+            v.validate(&out.dxil)
+                .expect("bounds-clamped LDS DXIL must pass dxil.dll validation");
+        }
+    }
+
+    #[test]
+    fn cube_image_store_and_mip_store_validate_as_dxil() {
+        let layout = vec![RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }];
+        let used = vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 0,
+            slot: 0,
+        }];
+        // Cube UAV store (dim = 3 -> Texture2DArray) and 2D mip store.
+        for words in [
+            [
+                0xBE81_0380, // s_mov_b32 s1, 0
+                0xF40C_0100,
+                0xFA00_0000, // s_load_dwordx8 s[4:11], s[0:1], null
+                0x7E00_0280, // v_mov_b32 v0, 0
+                0x7E02_0280, // v_mov_b32 v1, 0
+                0x7E04_0280, // v_mov_b32 v2, 0
+                0x7E08_02F2, // v_mov_b32 v4, 1.0
+                0x7E0A_0280, // v_mov_b32 v5, 0
+                0x7E0C_0280, // v_mov_b32 v6, 0
+                0x7E0E_02F2, // v_mov_b32 v7, 1.0
+                0xF020_0F18,
+                0x0001_0400, // image_store v[4:7], v[0:2], s[4:11] dmask:0xf dim:SQ_RSRC_IMG_CUBE
+                S_ENDPGM,
+            ],
+            [
+                0xBE81_0380, // s_mov_b32 s1, 0
+                0xF40C_0100,
+                0xFA00_0000, // s_load_dwordx8 s[4:11], s[0:1], null
+                0x7E00_0280, // v_mov_b32 v0, 0
+                0x7E02_0280, // v_mov_b32 v1, 0
+                0x7E04_0281, // v_mov_b32 v2, 1 (mip)
+                0x7E08_02F2, // v_mov_b32 v4, 1.0
+                0x7E0A_0280, // v_mov_b32 v5, 0
+                0x7E0C_0280, // v_mov_b32 v6, 0
+                0x7E0E_02F2, // v_mov_b32 v7, 1.0
+                0xF024_0F08,
+                0x0001_0400, // image_store_mip v[4:7], v[0:2], s[4:11] dmask:0xf dim:SQ_RSRC_IMG_2D
+                S_ENDPGM,
+            ],
+        ] {
+            let out = lower_cs(&words, layout.clone(), used.clone())
+                .expect("cube image_store and image_store_mip should lower");
+            assert!(!out.dxil.is_empty());
+            #[cfg(windows)]
+            if let Some(v) = crate::emit::validator::Validator::load() {
+                v.validate(&out.dxil)
+                    .expect("cube/mip image_store DXIL must pass dxil.dll validation");
+            }
+        }
+    }
+
+    #[test]
+    fn msaa_image_load_and_resinfo_validate_as_dxil() {
+        let layout = vec![RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }];
+        let used = vec![UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 0,
+            slot: 0,
+        }];
+        let words = [
+            0xBE81_0380, // s_mov_b32 s1, 0
+            0xF40C_0100,
+            0xFA00_0000, // s_load_dwordx8 s[4:11], s[0:1], null
+            0x7E00_0280, // v_mov_b32 v0, 0 (x)
+            0x7E02_0280, // v_mov_b32 v1, 0 (y)
+            0x7E04_0280, // v_mov_b32 v2, 0 (sample index)
+            0xF038_0F30,
+            0x0001_0400, // image_get_resinfo v[4:7], v0, s[4:11] dmask:0xf dim:SQ_RSRC_IMG_2D_MSAA
+            0xF000_0F30,
+            0x0001_0400, // image_load v[4:7], v[0:2], s[4:11] dmask:0xf dim:SQ_RSRC_IMG_2D_MSAA
+            S_ENDPGM,
+        ];
+        let out = lower_cs(&words, layout, used).expect("MSAA image_load and resinfo should lower");
+        assert!(!out.dxil.is_empty());
+        #[cfg(windows)]
+        if let Some(v) = crate::emit::validator::Validator::load() {
+            v.validate(&out.dxil)
+                .expect("MSAA image_load/resinfo DXIL must pass dxil.dll validation");
+        }
     }
 }

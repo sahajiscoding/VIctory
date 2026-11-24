@@ -317,8 +317,25 @@ pub(crate) fn resolve_typeless_view(typeless: u32, unordered: bool) -> Option<u3
     }
 }
 
-/// sRGB formats and their linear twins.
-pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
+/// sRGB formats and their linear twins (uncompressed and block-compressed).
+pub(crate) const SRGB: [(u32, u32); 7] = [
+    (29, 28), // R8G8B8A8_UNORM_SRGB / R8G8B8A8_UNORM
+    (72, 71), // BC1_UNORM_SRGB / BC1_UNORM
+    (75, 74), // BC2_UNORM_SRGB / BC2_UNORM
+    (78, 77), // BC3_UNORM_SRGB / BC3_UNORM
+    (91, 87), // B8G8R8A8_UNORM_SRGB / B8G8R8A8_UNORM
+    (93, 88), // B8G8R8X8_UNORM_SRGB / B8G8R8X8_UNORM
+    (99, 98), // BC7_UNORM_SRGB / BC7_UNORM
+];
+
+/// Returns the typeless DXGI family format when `format` belongs to an
+/// sRGB/linear pair, allowing both sRGB and linear views on the same host
+/// texture.
+pub(crate) fn srgb_typeless(format: u32) -> Option<u32> {
+    SRGB.iter()
+        .any(|&(srgb, linear)| srgb == format || linear == format)
+        .then(|| family(format))
+}
 
 /// The format a view of a title texture must name when its host copy is
 /// typeless (see [`DEPTH_FORMATS`], [`SRGB`]): the title's own; `None` if
@@ -921,10 +938,12 @@ fn host_texture(
     {
         d.format = typeless;
     }
-    // The host has no sRGB unordered access: such textures are typeless,
-    // their unordered access views plain UNORM.
-    if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
-        d.format = family(d.format);
+    // Textures in an sRGB/linear family are created typeless on the host so
+    // titles can bind both sRGB and linear views (RTV, SRV, and UAV) to the
+    // same surface without losing hardware gamma conversion or failing UAV
+    // creation on sRGB targets.
+    if let Some(typeless) = srgb_typeless(d.format) {
+        d.format = typeless;
     }
     const RENDER_TARGET: u32 = 1;
     // The clear value names the format too: format, then color or depth
@@ -2087,5 +2106,37 @@ mod tests {
         let t115 = host_texture(&d115, 0, std::ptr::null()).expect("format 115 RTV created");
         // SAFETY: live texture.
         assert!(matches!(unsafe { t115.GetDesc() }.Format.0, 28 | 115));
+    }
+
+    #[test]
+    fn srgb_and_linear_pairs_resolve_to_typeless_families() {
+        for &(srgb, linear) in &SRGB {
+            let t_srgb = srgb_typeless(srgb).expect("sRGB format has typeless family");
+            let t_lin = srgb_typeless(linear).expect("linear twin has typeless family");
+            assert_eq!(t_srgb, t_lin);
+            assert!(is_typeless(t_srgb));
+            assert_eq!(resolve_typeless_view(t_srgb, false), Some(linear));
+        }
+        // Non-sRGB formats stay typed unless depth/typeless.
+        assert_eq!(srgb_typeless(10), None); // R16G16B16A16_FLOAT
+        assert_eq!(srgb_typeless(41), None); // R32_FLOAT
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn srgb_and_bc7_host_textures_create_as_typeless_for_dual_views() {
+        if crate::host::host().is_none() {
+            return;
+        }
+        let mut rgba = texture(64, 64, 28, 1);
+        rgba.flags = 1; // RTV
+        let t_rgba = host_texture(&rgba, 0, std::ptr::null()).expect("RGBA8 typeless host texture");
+        // SAFETY: live texture.
+        assert_eq!(unsafe { t_rgba.GetDesc() }.Format.0, 27);
+
+        let bc7 = texture(64, 64, 99, 1); // BC7_UNORM_SRGB
+        let t_bc7 = host_texture(&bc7, 0, std::ptr::null()).expect("BC7 typeless host texture");
+        // SAFETY: live texture.
+        assert_eq!(unsafe { t_bc7.GetDesc() }.Format.0, 97);
     }
 }

@@ -577,7 +577,15 @@ pub(crate) fn texture_uav_desc(
     desc: Option<&[u32; 10]>,
 ) -> Option<Option<D3D12_UNORDERED_ACCESS_VIEW_DESC>> {
     let mut desc = match desc {
-        Some(words) => Some(uav_desc(words)),
+        Some(words) => {
+            let mut d = uav_desc(words);
+            if d.Format.0 == 0
+                && let Some(vf) = crate::resource::view_format(resource)
+            {
+                d.Format = DXGI_FORMAT(crate::resource::pc_format(vf) as i32);
+            }
+            Some(d)
+        }
         None => {
             // SAFETY: a live texture.
             let d = unsafe { texture.GetDesc() };
@@ -1093,7 +1101,16 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 // SAFETY: a live texture.
                 let own = unsafe { texture.GetDesc() }.Format.0 as u32;
                 let mut desc = match desc.as_ref() {
-                    Some(words) => Some(srv_desc(words)),
+                    Some(words) => {
+                        let mut d = srv_desc(words);
+                        if d.Format.0 == 0
+                            && crate::resource::is_typeless(own)
+                            && let Some(vf) = crate::resource::view_format(resource)
+                        {
+                            d.Format = DXGI_FORMAT(crate::resource::pc_format(vf) as i32);
+                        }
+                        Some(d)
+                    }
                     None if crate::resource::is_typeless(own) => {
                         let resolved = crate::resource::view_format(resource)
                             .map(crate::resource::pc_format)
