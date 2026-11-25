@@ -1069,12 +1069,37 @@ mod tests {
         return float4(p * 2.0 - 1.0, 0.5, 1.0);
     }";
 
+    #[test]
+    fn only_enabled_depth_bounds_change_the_pipeline_key() {
+        let mut g = GraphicsState::default();
+        let key = |g: &GraphicsState| super::super::library::name("graphics", &[], &[], &g.describe());
+        let plain_key = key(&g);
+        let legacy = Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth);
+        let mut extended = Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, g.depth1());
+
+        // SAFETY: each pointer is to a complete, matching stream subobject.
+        unsafe { g.read(21, (&raw const extended).cast()) };
+        assert_eq!(key(&g), plain_key, "a disabled test must preserve the existing key");
+
+        extended.1.DepthBoundsTestEnable = true.into();
+        // SAFETY: `extended` is still a complete subobject 21.
+        unsafe { g.read(21, (&raw const extended).cast()) };
+        assert!(g.depth1().DepthBoundsTestEnable.as_bool());
+        assert_ne!(key(&g), plain_key, "an enabled test needs a distinct key");
+
+        // SAFETY: `legacy` is a complete subobject 11.
+        unsafe { g.read(11, (&raw const legacy).cast()) };
+        assert!(!g.depth1().DepthBoundsTestEnable.as_bool());
+        assert_eq!(key(&g), plain_key, "legacy depth state clears the bounds flag");
+    }
+
     /// A graphics pipeline with `DepthBoundsTestEnable` loads back from the
     /// pipeline library and culls or passes fragments according to
     /// `OMSetDepthBounds` (including across a command-list cut).
     #[test]
     fn depth_bounds_pipeline_loads_and_filters_draws() {
         let Some(host) = host() else {
+            eprintln!("no host D3D12 device; skipped");
             return;
         };
         if !host.depth_bounds() {
@@ -1088,7 +1113,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let vs = compile(&dxc, dir.path(), VS, "vs_6_5");
         let ps = compile(&dxc, dir.path(), PS, "ps_6_5");
-        let (root, root_blob) = root_signature(&host.device, &[], &[], false).unwrap();
+        // The fixture has no descriptors. Don't require SM 6.6 bindless
+        // root flags just to exercise depth bounds on inbox D3D12 runtimes.
+        let root_desc = D3D12_ROOT_SIGNATURE_DESC {
+            Flags: D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT,
+            ..Default::default()
+        };
+        let mut blob = None;
+        // SAFETY: the empty description has no arrays; bytes are copied
+        // before the serialized blob is released.
+        let root_blob = unsafe {
+            D3D12SerializeRootSignature(&root_desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut blob, None)
+                .expect("serialize the test root signature");
+            let blob = blob.expect("serialized test root signature");
+            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
+                .to_vec()
+        };
+        // SAFETY: the bytes were returned by D3D12SerializeRootSignature.
+        let root: ID3D12RootSignature = unsafe { host.device.CreateRootSignature(0, &root_blob) }
+            .expect("create the test root signature");
 
         let mut g = GraphicsState::default();
         // Subobject 21 (`DEPTH_STENCIL1`) with `DepthBoundsTestEnable = true`,
