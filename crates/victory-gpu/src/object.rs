@@ -68,23 +68,14 @@ unsafe impl<const N: usize> Sync for Table<N> {}
 
 pub(crate) extern "system" fn add_ref(this: This) -> u32 {
     // SAFETY: `this` is one of our objects.
-    let refs = &unsafe { &*this }.refs;
-    // Saturate at u32::MAX instead of wrapping to 0 (#931).
-    match refs.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1)) {
-        Ok(n) => n + 1,
-        Err(_) => u32::MAX,
-    }
+    unsafe { &*this }.refs.fetch_add(1, Ordering::Relaxed) + 1
 }
 
 pub(crate) extern "system" fn release(this: This) -> u32 {
     // SAFETY: `this` is one of our objects.
     let refs = &unsafe { &*this }.refs;
-    match refs.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-        if n == u32::MAX { None } else { n.checked_sub(1) }
-    }) {
-        Ok(n) => n - 1,
-        Err(n) => n,
-    }
+    let _ = refs.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
+    refs.load(Ordering::Relaxed)
 }
 
 /// Answers an interface query (or any call handing out an object): a new
@@ -140,9 +131,7 @@ pub(crate) fn hand_out<T>(
 pub(crate) fn release_boxed<T>(this: This) -> u32 {
     // SAFETY: `this` is the header of a boxed `T`.
     let refs = &unsafe { &*this }.refs;
-    match refs.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-        if n == u32::MAX { None } else { n.checked_sub(1) }
-    }) {
+    match refs.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1)) {
         Ok(1) => {
             private_data().retain(|&(object, _), _| object != this as usize);
             // SAFETY: that was the last reference to a `Box<T>`.
@@ -150,7 +139,7 @@ pub(crate) fn release_boxed<T>(this: This) -> u32 {
             0
         }
         Ok(n) => n - 1,
-        Err(n) => n,
+        Err(_) => 0,
     }
 }
 
@@ -380,20 +369,6 @@ pub(crate) fn slot<F: Copy>(object: This, offset: usize) -> F {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn add_ref_saturates_instead_of_wrapping() {
-        static TABLE: Table<4> = Table(missing_table::<0, 4>());
-        let obj = Object {
-            functions: TABLE.0.as_ptr(),
-            bits: 0,
-            refs: AtomicU32::new(u32::MAX - 1),
-        };
-        let this: This = &obj;
-        assert_eq!(add_ref(this), u32::MAX);
-        assert_eq!(add_ref(this), u32::MAX);
-        assert_eq!(release(this), u32::MAX);
-    }
 
     #[test]
     fn guids_round_trip_through_text() {

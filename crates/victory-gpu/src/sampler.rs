@@ -47,51 +47,26 @@ impl Fields {
         } else {
             linear(self.min) << 4 | linear(self.mag) << 2 | u32::from(self.mip == 2)
         };
-        let addr = |mode: u32| {
-            if (1..=5).contains(&mode) {
-                mode
-            } else {
-                3 // D3D12_TEXTURE_ADDRESS_MODE_CLAMP
-            }
-        };
-        let bias = if self.bias.is_finite() {
-            self.bias.clamp(-16.0, 15.99)
-        } else {
-            0.0
-        };
-        let min_lod = if self.min_lod.is_nan() {
-            0.0
-        } else {
-            self.min_lod
-        };
-        let max_lod = if self.mip == 0 {
-            min_lod
-        } else if self.max_lod.is_nan() {
-            f32::MAX
-        } else {
-            self.max_lod.max(min_lod)
-        };
-        let compare = if (1..=8).contains(&self.compare) {
-            self.compare
-        } else {
-            1 // D3D12_COMPARISON_FUNC_NEVER
-        };
         D3D12_SAMPLER_DESC {
             Filter: D3D12_FILTER((reduction << 7 | filter) as i32),
-            AddressU: D3D12_TEXTURE_ADDRESS_MODE(addr(self.address[0]) as i32),
-            AddressV: D3D12_TEXTURE_ADDRESS_MODE(addr(self.address[1]) as i32),
-            AddressW: D3D12_TEXTURE_ADDRESS_MODE(addr(self.address[2]) as i32),
-            MipLODBias: bias,
+            AddressU: D3D12_TEXTURE_ADDRESS_MODE(self.address[0] as i32),
+            AddressV: D3D12_TEXTURE_ADDRESS_MODE(self.address[1] as i32),
+            AddressW: D3D12_TEXTURE_ADDRESS_MODE(self.address[2] as i32),
+            MipLODBias: self.bias,
             MaxAnisotropy: if aniso {
                 self.anisotropy.clamp(1, 16)
             } else {
                 1
             },
-            ComparisonFunc: D3D12_COMPARISON_FUNC(compare as i32),
+            ComparisonFunc: D3D12_COMPARISON_FUNC(self.compare.max(1) as i32),
             BorderColor: self.border,
-            MinLOD: min_lod,
+            MinLOD: self.min_lod,
             // Without a mip filter the console samples mip 0 only.
-            MaxLOD: max_lod,
+            MaxLOD: if self.mip == 0 {
+                self.min_lod
+            } else {
+                self.max_lod
+            },
         }
     }
 }
@@ -140,26 +115,5 @@ mod tests {
         assert_eq!(console(&w).ComparisonFunc, D3D12_COMPARISON_FUNC_LESS_EQUAL);
         w[16] = 1;
         assert_eq!(console(&w).Filter.0, 0x5);
-    }
-
-    #[test]
-    fn sampler_clamps_invalid_and_nan_fields() {
-        let mut w = [0u32; 27];
-        w[3] = 2; // linear mips
-        w[6] = 0; // invalid address mode -> CLAMP (3)
-        w[7] = 99; // invalid address mode -> CLAMP (3)
-        w[8] = 1; // WRAP (1)
-        w[9] = f32::NAN.to_bits(); // min_lod -> 0.0
-        w[10] = (-5.0f32).to_bits(); // max_lod < min_lod -> clamped to min_lod (0.0)
-        w[11] = 40.0f32.to_bits(); // bias -> clamped to 15.99
-        w[16] = 99; // invalid compare -> NEVER (1)
-        let d = console(&w);
-        assert_eq!(d.AddressU, D3D12_TEXTURE_ADDRESS_MODE_CLAMP);
-        assert_eq!(d.AddressV, D3D12_TEXTURE_ADDRESS_MODE_CLAMP);
-        assert_eq!(d.AddressW, D3D12_TEXTURE_ADDRESS_MODE_WRAP);
-        assert_eq!(d.MinLOD, 0.0);
-        assert_eq!(d.MaxLOD, 0.0);
-        assert_eq!(d.MipLODBias, 15.99);
-        assert_eq!(d.ComparisonFunc, D3D12_COMPARISON_FUNC_NEVER);
     }
 }

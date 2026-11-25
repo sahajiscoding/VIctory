@@ -31,43 +31,27 @@ const THUNK_SIZE: usize = 32;
 /// `base` is the image `info` describes, mapped and not yet running.
 pub(crate) unsafe fn redirect(base: usize, info: &ImageInfo) -> Result<usize> {
     let Some(tls) = &info.tls else { return Ok(0) };
-    let image_size = info.size_of_image as usize;
-    let dir_off = (tls.directory_rva as usize)
-        .checked_add(TLS64_ADDRESS_OF_INDEX)
-        .filter(|&o| o.checked_add(size_of::<usize>()).is_some_and(|e| e <= image_size))
-        .ok_or_else(|| anyhow::anyhow!("TLS directory lies outside the image"))?;
-    let image_end = base
-        .checked_add(image_size)
-        .ok_or_else(|| anyhow::anyhow!("image end overflows address space"))?;
-    // SAFETY: `dir_off + size_of::<usize>() <= image_size`, so the TLS
-    // directory field is inside the mapped image.
-    let index_addr = unsafe { ((base + dir_off) as *const usize).read() };
-    if index_addr < base || index_addr.checked_add(size_of::<u32>()).is_none_or(|e| e > image_end) {
-        bail!("TLS AddressOfIndex ({index_addr:#x}) lies outside the mapped image");
-    }
-    let index_at = index_addr as *mut u32;
-    // SAFETY: bounds-checked inside `[base, image_end)`.
+    // SAFETY: the TLS directory and the index it points to are in the image;
+    // the OS relocated the pointer and wrote the index.
+    let index_at = unsafe {
+        ((base + tls.directory_rva as usize + TLS64_ADDRESS_OF_INDEX) as *const usize).read()
+    } as *mut u32;
+    // SAFETY: as above.
     let index = unsafe { index_at.read() };
     if index == 0 {
         return Ok(0);
     }
-    let thunks = thunks(near(base, image_size)?, index)?;
+    let thunks = thunks(near(base, info.size_of_image as usize)?, index)?;
     let mut patched = 0;
     for section in info
         .sections
         .iter()
-        .filter(|s| s.characteristics & SCN_MEM_EXECUTE != 0 && s.virtual_size > 0)
+        .filter(|s| s.characteristics & SCN_MEM_EXECUTE != 0)
     {
-        let len = section.virtual_size as usize;
-        let Some(end) = (section.rva as usize).checked_add(len) else {
-            continue;
-        };
-        if end > image_size {
-            continue;
-        }
         let start = base + section.rva as usize;
+        let len = section.virtual_size as usize;
         let mut old = 0;
-        // SAFETY: the section is non-empty and inside the mapped image.
+        // SAFETY: the section is part of the mapped image.
         if unsafe { VirtualProtect(start as _, len, PAGE_EXECUTE_READWRITE, &mut old) } == 0 {
             bail!(
                 "VirtualProtect(code) failed: {}",
@@ -98,7 +82,7 @@ fn patch(code: &mut [u8], at: usize, thunks: usize) -> usize {
         let c = &code[i..i + LOAD_LEN];
         let rex = c[1];
         let reg = usize::from((c[3] >> 3) & 7) | if rex & 4 != 0 { 8 } else { 0 };
-        // shortcut: a byte match, not a decode. In Grand Theft Auto VI all
+        // shortcut: a byte match, not a decode. In the title all
         // 53,246 hits are instruction starts and none is missed (checked
         // against a full disassembly); decode .text if a title shows one.
         if c[0] == 0x65
@@ -124,11 +108,7 @@ fn patch(code: &mut [u8], at: usize, thunks: usize) -> usize {
 /// Fills `block` with one thunk per register: `mov r, gs:[0x58];
 /// lea r, [r + index * 8]; ret` (flags untouched, like the load it replaces).
 fn thunks(block: *mut u8, index: u32) -> Result<usize> {
-    let byte_off = u64::from(index)
-        .checked_mul(8)
-        .and_then(|o| i32::try_from(o).ok())
-        .ok_or_else(|| anyhow::anyhow!("TLS index {index} exceeds disp32 reach"))?;
-    let disp = byte_off.to_le_bytes();
+    let disp = (index * 8).to_le_bytes();
     for reg in 0..16u8 {
         let (r, low) = (reg >> 3, reg & 7);
         let mut code = vec![0x65, 0x48 | r << 2, 0x8B, low << 3 | 4, 0x25, 0x58, 0, 0, 0];

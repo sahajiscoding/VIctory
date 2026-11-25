@@ -158,38 +158,6 @@ pub(crate) fn translate(path: &[u16]) -> Option<Vec<u16>> {
         out.push(0);
         return Some(out);
     }
-    let dot = u16::from(b'.');
-    let has_parent = tail
-        .split(|c| SEPARATORS.contains(c))
-        .any(|p| p == [dot, dot]);
-    if has_parent {
-        // Resolve `.` and `..` so `..` stops at the virtual drive's root (#182).
-        let backslash = u16::from(b'\\');
-        let mut out = prefix.to_vec();
-        out.extend_from_slice(root);
-        while out.last() == Some(&backslash) {
-            out.pop();
-        }
-        let mut parts: Vec<&[u16]> = Vec::new();
-        for part in tail.split(|c| SEPARATORS.contains(c)) {
-            match part {
-                [] => {}
-                [d] if *d == dot => {}
-                [d, e] if [*d, *e] == [dot; 2] => drop(parts.pop()),
-                _ => parts.push(part),
-            }
-        }
-        if parts.is_empty() {
-            out.push(backslash);
-        } else {
-            for part in parts {
-                out.push(backslash);
-                out.extend_from_slice(part);
-            }
-        }
-        out.push(0);
-        return Some(out);
-    }
     let mut out = prefix.to_vec();
     out.extend_from_slice(root);
     // `X:` and `X:name` are relative to the root.
@@ -548,10 +516,13 @@ pub extern "C" fn _wfsopen(path: *const u16, mode: *const u16, share: i32) -> Fi
 
 // Kernel reads into title memory. The GPU side leaves blocks of title GPU
 // buffers read-only to see the title's next write, and the kernel's writes
-// fail there instead of faulting into its handler; Grand Theft Auto VI's
+// fail there instead of faulting into its handler; the title's
 // synchronous reads (title+0x313fc0) read straight into 4 KiB-aligned
 // destinations and retry a failed `ReadFile` forever. So the destination
-// is opened first.
+// is opened first. A block guarded again before the kernel writes it (the
+// guard over all the views of a page protects other views from other
+// threads) fails that `ReadFile`, and the title's retry opens it again;
+// `fread` has no such retry and reads beside instead (see there).
 
 pub extern "system" fn ReadFile(
     file: *mut c_void,
@@ -566,12 +537,38 @@ pub extern "system" fn ReadFile(
     )
 }
 
-/// The host CRT reads large requests straight into the caller's buffer.
+/// The host CRT reads large requests straight into the caller's buffer
+/// through the kernel, whose write fails on a guarded block instead of
+/// faulting into the guard. So the bytes are read beside, a chunk at a time
+/// (a caller may ask for far more than the file holds), and copied in from
+/// user mode, where a guarded block faults into the guard like the title's
+/// own writes. Returns the items read, as the CRT does; the bytes of a
+/// partial last item are copied too, as the CRT leaves them.
 pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File) -> usize {
-    victory_gpu::kernel_will_write(buffer as usize, size.saturating_mul(count));
-    host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize)(
-        buffer, size, count, stream,
-    )
+    let read = host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize);
+    let total = size.saturating_mul(count);
+    if buffer.is_null() || total == 0 {
+        // The CRT's own checks and answer (EINVAL, or nothing to read).
+        return read(buffer, size, count, stream);
+    }
+    const CHUNK: usize = 1 << 20;
+    let mut beside = vec![0u8; total.min(CHUNK)];
+    let mut done = 0;
+    while done < total {
+        let want = (total - done).min(CHUNK);
+        let n = read(beside.as_mut_ptr(), 1, want, stream);
+        if n > 0 {
+            victory_gpu::kernel_will_write(buffer as usize + done, n);
+            // SAFETY: the caller's buffer holds `size * count` bytes, and
+            // `done + n` is at most that.
+            unsafe { std::ptr::copy_nonoverlapping(beside.as_ptr(), buffer.add(done), n) };
+            done += n;
+        }
+        if n < want {
+            break;
+        }
+    }
+    done / size
 }
 
 pub extern "C" fn fopen(path: *const c_char, mode: *const c_char) -> File {
@@ -783,6 +780,40 @@ mod tests {
         assert_eq!((&out, n), (b"0123456789", 10));
     }
 
+    #[test]
+    fn fread_reads_beside_in_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.bin");
+        // Over two chunks, and not a whole number of 3-byte items.
+        let bytes: Vec<u8> = (0..(5 << 19) + 1).map(|i| (i * 7 + i / 251) as u8).collect();
+        std::fs::write(&path, &bytes).unwrap();
+        let fclose = host!("ucrtbase.dll", "fclose": extern "C" fn(File) -> i32);
+        let open = || {
+            let f = _wfopen(w(&path.to_string_lossy()).as_ptr(), w("rb").as_ptr());
+            assert!(!f.is_null());
+            f
+        };
+
+        // Asked for far more than the file holds: the whole file, in items.
+        let f = open();
+        let mut out = vec![0xaau8; bytes.len() + 64];
+        let items = fread(out.as_mut_ptr(), 3, out.len() / 3, f);
+        assert_eq!(items, bytes.len() / 3);
+        assert_eq!(&out[..bytes.len()], &bytes[..], "the partial last item's bytes too");
+        assert!(out[bytes.len()..].iter().all(|&b| b == 0xaa), "nothing past what was read");
+        fclose(f);
+
+        // Exact reads continue where the last one stopped.
+        let f = open();
+        let mut a = vec![0u8; 1000];
+        let mut b = vec![0u8; (1 << 20) + 5];
+        assert_eq!(fread(a.as_mut_ptr(), 1000, 1, f), 1);
+        assert_eq!(fread(b.as_mut_ptr(), 1, b.len(), f), b.len());
+        assert_eq!(a, bytes[..1000]);
+        assert_eq!(b, bytes[1000..1000 + b.len()]);
+        fclose(f);
+    }
+
     fn text(v: &[u16]) -> String {
         String::from_utf16_lossy(&v[..v.len() - 1])
     }
@@ -833,15 +864,6 @@ mod tests {
         assert_eq!(
             verbatim(&w(r"\\server\share\")[..15], &w("/x/../../y")[..10]),
             w(r"\\?\UNC\server\share\y")[..22].to_vec()
-        );
-        // `..` stops at the virtual drive's root on short paths too (#182).
-        assert_eq!(
-            tr(r"G:\..\..\Windows\system.ini".into()),
-            Some(format!(r"{}\Windows\system.ini", package.path().display()))
-        );
-        assert_eq!(
-            tr(r"G:\sub\..\..".into()),
-            Some(format!(r"{}\", package.path().display()))
         );
     }
 

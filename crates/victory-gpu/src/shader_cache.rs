@@ -1,7 +1,7 @@
 //! Translated shaders kept on disk (decision 0003): under the configured
-//! cache folder, keyed by the container's content and by the VIctory build
-//! that translated it (the BLAKE3 of our executable), so a rebuilt
-//! translator never serves an old translation. Entries go through
+//! cache folder, keyed by the container's content and by the translator
+//! that translated it (its source fingerprint and settings, see `build`), so
+//! a changed translator never serves an old translation. Entries go through
 //! `victory-pipeline`'s content-addressed cache, which writes them
 //! atomically; an entry that does not read back is translated again.
 //!
@@ -10,11 +10,12 @@
 //! are ignored anyway).
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
 
 use victory_pipeline::{Cache, Converter};
-use victory_shader::emit::{ConstRootView, HostShader, StaticSampler, UserData};
+use victory_shader::emit::{HostShader, StaticSampler, UserData};
+use victory_shader::resource::RootIndexedView;
 use victory_shader::{HwStage, RootType};
 
 static CACHE: OnceLock<Cache> = OnceLock::new();
@@ -36,71 +37,75 @@ pub(crate) fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
 
-/// Maximum wave lane count supported by the active host GPU (64 on RDNA/Intel,
-/// 32 on 32-lane GPUs; defaults to 64 off Windows or before host init).
-fn host_max_wave_size() -> u32 {
-    #[cfg(windows)]
-    {
-        crate::host::host().map_or(64, |h| h.wave_lane_count_max())
+/// What identifies the translation, besides the container: the shader
+/// crate's fingerprint (its source, every switch it reads, the host facts the
+/// device gave it, the loop limit, barrier waits and clean-up passes) and
+/// this file's encoding of the result. Not the whole executable any more: a
+/// rebuild that leaves the translator alone keeps its translations (each new
+/// build used to translate the title's thousands of shaders again, which kept
+/// the first minutes of every test run short of pipelines).
+/// `VICTORY_SHADER_CACHE_KEY=exe` restores the old key (the executable's hash).
+/// Worked out per lookup, so a translation made before the device said its
+/// wave size is never filed under the later key.
+fn build() -> [u8; 32] {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    let limit = victory_shader::emit::loop_limit();
+    if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
+        WARNED.call_once(|| tracing::warn!(limit, "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"));
     }
-    #[cfg(not(windows))]
-    {
-        64
+    static EXE: OnceLock<Option<[u8; 32]>> = OnceLock::new();
+    let exe = EXE.get_or_init(|| {
+        if std::env::var_os("VICTORY_SHADER_CACHE_KEY").is_some_and(|v| v == "exe") {
+            match std::env::current_exe().and_then(std::fs::read) {
+                Ok(bytes) => Some(*blake3::hash(&bytes).as_bytes()),
+                Err(e) => {
+                    tracing::warn!(error = %e, "cannot read our executable; keying on the translator");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    });
+    let mut h = blake3::Hasher::new();
+    h.update(b"victory shader cache key 2\0");
+    if let Some(exe) = exe {
+        h.update(exe);
     }
+    h.update(&victory_shader::emit::translation_fingerprint());
+    h.update(include_bytes!("shader_cache.rs"));
+    *h.finalize().as_bytes()
 }
 
-/// What identifies this build: the BLAKE3 of our executable file, the host
-/// GPU's wave-size capability, and the translation settings it runs with (the
-/// loop limit, which a diagnostics build can change at run time).
-fn build() -> &'static [u8; 32] {
-    static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
-    BUILD.get_or_init(|| {
-        let exe = std::env::current_exe().and_then(std::fs::read);
-        let limit = victory_shader::emit::loop_limit();
-        let max_wave = host_max_wave_size();
-        if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
-            tracing::warn!(
-                limit,
-                "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
-            );
-        }
-        match exe {
-            Ok(mut bytes) => {
-                bytes.extend_from_slice(&limit.to_le_bytes());
-                bytes.extend_from_slice(&max_wave.to_le_bytes());
-                *blake3::hash(&bytes).as_bytes()
-            }
-            Err(e) => {
-                // Without it no entry can be trusted: a fresh key per run.
-                tracing::warn!(error = %e, "cannot read our executable; shader cache unused");
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default();
-                *blake3::hash(&now.as_nanos().to_le_bytes()).as_bytes()
-            }
-        }
-    })
+/// The offline warm-up (`victory translate --warm`): `container` is
+/// translated into the cache unless it is there already. `Ok(true)`: it
+/// was translated now. Needs [`use_shader_cache`] and the same host facts
+/// the run will have (`victory_shader::emit::translation_fingerprint`).
+pub fn warm(container: &[u8]) -> Result<bool, String> {
+    let cache = CACHE.get().ok_or("no shader cache")?;
+    let ran = AtomicBool::new(false);
+    let translate = |c: &[u8]| {
+        ran.store(true, Ordering::Relaxed);
+        victory_shader::emit::translate(c).map_err(|e| e.to_string())
+    };
+    cached(cache, &build(), container, translate).map(|_| ran.load(Ordering::Relaxed))
 }
 
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let max_wave = host_max_wave_size();
-    let translate =
-        move |c: &[u8]| victory_shader::emit::translate_for(c, max_wave).map_err(|e| e.to_string());
+    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
     match CACHE.get() {
-        Some(cache) => cached(cache, build(), container, translate),
+        Some(cache) => cached(cache, &build(), container, translate),
         None => translate(container),
     }
 }
 
 /// The cache entry's converter: the build and the container in, the
-/// encoded translation out. `ran` tells a miss from a hit; `produced` holds
-/// the translated shader so a cache-write failure still delivers it (#358).
+/// encoded translation out. `ran` tells a miss from a hit.
 struct Translate<F> {
     translate: F,
     ran: AtomicBool,
-    produced: Mutex<Option<HostShader>>,
 }
 
 impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Translate<F> {
@@ -114,9 +119,7 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
         let shader = (self.translate)(&input[32..]).map_err(anyhow::Error::msg)?;
-        let encoded = encode(&shader);
-        *self.produced.lock().unwrap_or_else(|e| e.into_inner()) = Some(shader);
-        Ok(encoded)
+        Ok(encode(&shader))
     }
 }
 
@@ -130,27 +133,11 @@ fn cached(
     let converter = Translate {
         translate,
         ran: AtomicBool::new(false),
-        produced: Mutex::new(None),
     };
     for _ in 0..2 {
-        let path = match cache.get_or_convert(&converter, &input) {
-            Ok(path) => path,
-            Err(e) => {
-                // If translation itself succeeded and only persisting the entry
-                // to disk failed, still return the translated shader (#358).
-                if let Some(shader) = converter
-                    .produced
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .take()
-                {
-                    MISSES.fetch_add(1, Ordering::Relaxed);
-                    tracing::warn!(error = %format!("{e:#}"), "shader cache write failed; using in-memory translation");
-                    return Ok(shader);
-                }
-                return Err(format!("{e:#}"));
-            }
-        };
+        let path = cache
+            .get_or_convert(&converter, &input)
+            .map_err(|e| format!("{e:#}"))?;
         if let Some(shader) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
             let (counter, what) = if converter.ran.load(Ordering::Relaxed) {
                 (&MISSES, "translated and cached")
@@ -165,18 +152,10 @@ fn cached(
         let _ = std::fs::remove_file(&path);
     }
     MISSES.fetch_add(1, Ordering::Relaxed);
-    if let Some(shader) = converter
-        .produced
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .take()
-    {
-        return Ok(shader);
-    }
     (converter.translate)(container)
 }
 
-const MAGIC: &[u8; 4] = b"VSH3";
+const MAGIC: &[u8; 4] = b"VSH1";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -255,15 +234,18 @@ fn encode(s: &HostShader) -> Vec<u8> {
         word(&mut out, slots.len() as u32);
         out.extend(slots);
     }
-    for views in [&s.const_cbvs, &s.const_srvs, &s.const_uavs] {
-        word(&mut out, views.len() as u32);
-        for v in views {
-            word(&mut out, u32::from(v.slot));
-            word(&mut out, v.dword);
-            word(&mut out, v.register);
+    word(&mut out, s.root_indexed_views.len() as u32);
+    for view in &s.root_indexed_views {
+        for value in [
+            u32::from(view.table_slot),
+            u32::from(view.constant_slot),
+            view.constant_dword,
+            view.byte_offset,
+            u32::from(view.shift),
+        ] {
+            word(&mut out, value);
         }
     }
-    word(&mut out, s.wave_size.unwrap_or(0));
     out
 }
 
@@ -281,18 +263,6 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         fn list(&mut self) -> Option<Vec<u8>> {
             let n = self.word()? as usize;
             Some(self.take(n)?.to_vec())
-        }
-        fn const_views(&mut self) -> Option<Vec<ConstRootView>> {
-            let n = self.word()? as usize;
-            let mut out = Vec::with_capacity(n.min(256));
-            for _ in 0..n {
-                out.push(ConstRootView {
-                    slot: u8::try_from(self.word()?).ok()?,
-                    dword: self.word()?,
-                    register: self.word()?,
-                });
-            }
-            Some(out)
         }
     }
     let mut r = Reader(bytes);
@@ -333,13 +303,17 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     let root_cbvs = r.list()?;
     let root_srvs = r.list()?;
     let root_uavs = r.list()?;
-    let const_cbvs = r.const_views()?;
-    let const_srvs = r.const_views()?;
-    let const_uavs = r.const_views()?;
-    let wave_size = match r.word()? {
-        0 => None,
-        w => Some(w),
-    };
+    let n = r.word()? as usize;
+    let mut root_indexed_views = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        root_indexed_views.push(RootIndexedView {
+            table_slot: u8::try_from(r.word()?).ok()?,
+            constant_slot: u8::try_from(r.word()?).ok()?,
+            constant_dword: r.word()?,
+            byte_offset: r.word()?,
+            shift: u8::try_from(r.word()?).ok().filter(|&s| s < 32)?,
+        });
+    }
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -349,10 +323,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_cbvs,
         root_srvs,
         root_uavs,
-        const_cbvs,
-        const_srvs,
-        const_uavs,
-        wave_size,
+        root_indexed_views,
     })
 }
 
@@ -380,18 +351,13 @@ mod tests {
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
             root_uavs: vec![1],
-            const_cbvs: vec![],
-            const_srvs: vec![ConstRootView {
-                slot: 4,
-                dword: 0,
-                register: 0,
+            root_indexed_views: vec![RootIndexedView {
+                table_slot: 1,
+                constant_slot: 2,
+                constant_dword: 3,
+                byte_offset: 32,
+                shift: 5,
             }],
-            const_uavs: vec![ConstRootView {
-                slot: 4,
-                dword: 2,
-                register: 0,
-            }],
-            wave_size: Some(32),
         }
     }
 

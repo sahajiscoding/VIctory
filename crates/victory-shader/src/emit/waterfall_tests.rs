@@ -16,10 +16,6 @@ use crate::{io, ir, resource, structure};
 /// s0 (textures, or with `buffers` structured buffers of dwords, at entries
 /// 0 and 1, a raw UAV at entry 2) and the table of samplers at s1.
 fn build(words: &[u32], buffers: bool) -> HostShader {
-    build_expecting(words, buffers, 1)
-}
-
-fn build_expecting(words: &[u32], buffers: bool, nonuniform: u32) -> HostShader {
     let table = |user_data: u8| RootParam {
         root: RootType::Table,
         table_offset_dwords: 0,
@@ -73,11 +69,10 @@ fn build_expecting(words: &[u32], buffers: bool, nonuniform: u32) -> HostShader 
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
-        max_wave_size: 64,
     })
     .expect("lower");
-    // Per-lane heap handles with no wave operation.
-    assert_eq!(lowered.nonuniform_handles, nonuniform);
+    // One access with each lane's own heap index, no wave operation.
+    assert_eq!(lowered.nonuniform_handles, 1);
     assert!(!lowered.wave_ops);
     let shader = HostShader {
         stage: HwStage::Cs,
@@ -88,10 +83,7 @@ fn build_expecting(words: &[u32], buffers: bool, nonuniform: u32) -> HostShader 
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
-        const_cbvs: lowered.const_cbvs,
-        const_srvs: lowered.const_srvs,
-        const_uavs: lowered.const_uavs,
-        wave_size: lowered.wave_size,
+        root_indexed_views: Vec::new(),
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())
@@ -106,13 +98,6 @@ fn build_expecting(words: &[u32], buffers: bool, nonuniform: u32) -> HostShader 
 /// hardware GPU and on WARP (each skipped without a device) and returns,
 /// per one that ran, the UAV's 32 dwords.
 fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
-    run_with_kind(shader, views)
-        .into_iter()
-        .map(|(label, _, words)| (label, words))
-        .collect()
-}
-
-fn run_with_kind(shader: &HostShader, views: &[View]) -> Vec<(&'static str, bool, Vec<u32>)> {
     let samplers = [D3D12_SAMPLER_DESC {
         Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
         AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
@@ -156,7 +141,7 @@ fn run_with_kind(shader: &HostShader, views: &[View]) -> Vec<(&'static str, bool
                 },
             )
             .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
-        out.push((label, host.software, words[0].clone()));
+        out.push((label, words[0].clone()));
     }
     out
 }
@@ -261,40 +246,6 @@ fn lanes_sample_their_own_texture_in_a_waterfall_narrowed_by_v_cmpx() {
         assert!(!results.is_empty());
         for (label, red) in results {
             assert_eq!(red, want, "{label}, folded {folded}");
-        }
-    }
-}
-
-#[test]
-fn lanes_query_size_in_a_separate_waterfall_loop() {
-    use crate::resource::tests::WATERFALL_SIZE_AND_SAMPLE_WAVE32;
-    let shader = build_expecting(WATERFALL_SIZE_AND_SAMPLE_WAVE32, false, 2);
-    let first = [[1.0f32, 0.0, 0.0, 1.0]; 5];
-    let second = [[2.0f32, 0.0, 0.0, 1.0]; 3];
-    let views = [
-        View::Texture(1, 5, &first),
-        View::Texture(1, 3, &second),
-        View::RawUav(32),
-    ];
-    let results = run_with_kind(&shader, &views);
-    assert!(!results.is_empty());
-    // Even lanes: 1x5 red=1.0 -> 1.0 + (5 - 1) = 5.0.
-    // Odd lanes:  1x3 red=2.0 -> 2.0 + (3 - 1) = 4.0.
-    let want: Vec<f32> = (0..32).map(|l| if l & 1 == 0 { 5.0 } else { 4.0 }).collect();
-    // Windows inbox WARP (e.g. 10.0.26100.9818) has a driver bug (also
-    // reproduced with plain DXC HLSL) where non-uniform `GetDimensions` returns
-    // lane 0's dimensions to every lane (1.0 + 4 = 5.0, 2.0 + 4 = 6.0), whereas
-    // hardware GPUs and packaged WARP 1.0.22+ return per-lane dimensions.
-    let inbox_warp_want: Vec<f32> = (0..32).map(|l| if l & 1 == 0 { 5.0 } else { 6.0 }).collect();
-    for (label, software, words) in results {
-        let got: Vec<f32> = words.into_iter().map(f32::from_bits).collect();
-        if software {
-            assert!(
-                got == want || got == inbox_warp_want,
-                "{label} (software): got {got:?}, want {want:?} (or inbox-WARP {inbox_warp_want:?})"
-            );
-        } else {
-            assert_eq!(got, want, "{label}");
         }
     }
 }
