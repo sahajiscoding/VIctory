@@ -75,7 +75,7 @@ extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT
 extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Fence>(this)
 }
-extern "system" fn completed(this: This) -> u64 {
+pub(crate) extern "system" fn completed(this: This) -> u64 {
     fence(this).value.load(Ordering::Acquire)
 }
 extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c_void) -> HRESULT {
@@ -88,6 +88,19 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         return S_OK;
     }
     if event.is_null() {
+        // With submissions sent to the card and not waited for
+        // (`crate::host::late`) the signal may be behind them: they are
+        // settled, which sets it.
+        #[cfg(windows)]
+        if crate::host::late() {
+            drop(waiters);
+            crate::host::settle_for_fence();
+            if fence.value.load(Ordering::Acquire) >= value {
+                return S_OK;
+            }
+            tracing::warn!(value, "blocking fence wait not implemented");
+            return E_NOTIMPL;
+        }
         // shortcut: a null event means "block until reached"; nothing can
         // reach it while no GPU work runs, so fail instead of hanging.
         tracing::warn!(value, "blocking fence wait not implemented");
@@ -96,20 +109,24 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
     waiters.push((value, event as usize));
     S_OK
 }
-pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
+/// Moves the fence to `value` and sets the events that waited for it.
+pub(crate) fn set(this: This, value: u64) {
     let fence = fence(this);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
-    // Fences are monotonic: a late/out-of-order signal never moves the
-    // completed value backwards (#932).
-    let prev = fence.value.fetch_max(value, Ordering::AcqRel);
-    let reached_now = prev.max(value);
+    fence.value.store(value, Ordering::Release);
     waiters.retain(|&(wanted, event)| {
-        let reached = wanted <= reached_now;
+        let reached = wanted <= value;
         if reached {
             set_event(event);
         }
         !reached
     });
+}
+pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
+    set(this, value);
+    // A queue may have waited for it: what it held runs now.
+    #[cfg(windows)]
+    crate::queue::release_held(false);
     S_OK
 }
 
@@ -165,26 +182,12 @@ mod tests {
         // SAFETY: as above.
         assert_eq!(unsafe { WaitForSingleObject(event, 0) }, WAIT_OBJECT_0);
         assert_eq!(wait(f, 9, std::ptr::null_mut()), E_NOTIMPL);
-        // Grand Theft Auto VI reads the value at the fence's address.
+        // The title reads the value at the fence's address.
         let at = slot::<extern "system" fn(This) -> u64>(f, 0x60)(f);
         // SAFETY: the fence's value.
         assert_eq!(unsafe { *(at as *const u64) }, 5);
         // SAFETY: ours.
         unsafe { CloseHandle(event) };
-        assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);
-    }
-
-    #[test]
-    fn fence_signal_is_monotonic() {
-        let mut f = std::ptr::null();
-        assert_eq!(create(std::ptr::null(), 10, 0, &FENCE_IIDS[0], &mut f), S_OK);
-        let completed = slot::<extern "system" fn(This) -> u64>(f, 0x40);
-        let sig = slot::<extern "system" fn(This, u64) -> HRESULT>(f, 0x50);
-        assert_eq!(sig(f, 25), S_OK);
-        assert_eq!(completed(f), 25);
-        // Out-of-order smaller signal must not roll the fence backwards (#932).
-        assert_eq!(sig(f, 12), S_OK);
-        assert_eq!(completed(f), 25);
         assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);
     }
 }

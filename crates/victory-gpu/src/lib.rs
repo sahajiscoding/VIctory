@@ -31,6 +31,8 @@ pub mod frame;
 mod host;
 #[cfg(windows)]
 mod indirect;
+#[cfg(windows)]
+mod inplace;
 pub mod list;
 pub mod object;
 pub mod pipeline;
@@ -45,7 +47,11 @@ mod sampler;
 #[cfg(windows)]
 pub mod shader_cache;
 #[cfg(windows)]
+mod memory;
+#[cfg(windows)]
 mod shadow;
+#[cfg(windows)]
+mod tiles;
 pub mod signature;
 #[cfg(windows)]
 mod texture;
@@ -64,13 +70,14 @@ pub struct HdrInfo {
 
 #[cfg(windows)]
 pub use host::{hdr_info, on_failure};
-#[cfg(windows)]
-pub use watch::{physical_memory_written, title_memory_remapped, writing as kernel_will_write};
-
-#[cfg(not(windows))]
-pub fn physical_memory_written() {}
-
 #[cfg(not(windows))]
 pub fn hdr_info() -> HdrInfo {
     HdrInfo::default()
 }
+#[cfg(windows)]
+pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
+#[cfg(windows)]
+pub use watch::{
+    title_memory_reading, title_memory_remapped, title_memory_remapping, title_memory_written,
+    writing as kernel_will_write,
+};

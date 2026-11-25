@@ -1,276 +1,196 @@
-//! Frame pacing: the console's display interrupt, which titles schedule
-//! against and wait on. Driven here from a steady monotonic clock so the
-//! title paces its loop at the rate it asked for, using a Windows
-//! high-resolution waitable timer (`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`)
-//! plus a short spin-tail to the exact deadline so release builds do not
-//! suffer 15.6 ms OS timer-quantum drift.
+//! Frame pacing: the title sets a frame interval and waits for each frame
+//! to begin. Ours is a clock started by the first interval set, ticking
+//! once per interval; the token is the frame number. Each event kind
+//! (origin, vblank, flip) happens once per tick, so two waits for the same
+//! kind never end on the same tick: the title polls the origin
+//! with "token on time-out" (starting its next frame at once) and is paced
+//! by a blocking wait for the flip before each present.
+//!
+//! shortcut: event offsets are ignored (every event is at the tick); tie
+//! the clock to presentation if a title paces by them.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use crate::object::{E_INVALIDARG, HRESULT, S_OK, This};
+use crate::object::{HRESULT, S_FALSE, S_OK, This};
 
-const TIMEOUT: HRESULT = 0x8007_0102_u32 as i32; // WAIT_TIMEOUT
-
-/// One 60 Hz frame, the default interval before the title sets one.
-const SIXTIETH: Duration = Duration::from_nanos(16_666_667);
-
-/// Spin-tail window before the exact tick deadline: sleeping stops this far
-/// ahead of the target `Instant` and yields/spins out the final sub-millisecond
-/// to absorb OS wakeup jitter.
-const SPIN_MARGIN: Duration = Duration::from_micros(500);
+/// What a wait returns when its time is up first.
+const TIMEOUT: HRESULT = S_FALSE;
+/// The frame-origin event: the one that starts frames and makes tokens.
+const ORIGIN: u32 = 0;
+/// Make the frame's token even if the wait times out (the title starts the
+/// frame early).
+const TOKEN_ON_TIMEOUT: u32 = 2;
+const SIXTIETH: Duration = Duration::from_micros(16_667);
 
 struct Clock {
-    /// Anchor time for `first`.
     start: Instant,
     interval: Duration,
-    /// Tick number at `start`, monotonic across interval changes.
+    /// The tick number at `start` (ticks go on across interval changes).
     first: u64,
-    /// Optional per-event scheduling offset in microseconds (`schedule`).
-    offsets_us: [u32; 4],
 }
 
 static CLOCK: Mutex<Option<Clock>> = Mutex::new(None);
-/// Last tick delivered, per event kind (origin, present, ...).
-static LAST: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
-/// Frames begun so far (frame waits that ended).
 static FRAME: AtomicU64 = AtomicU64::new(0);
+
+fn clock() -> std::sync::MutexGuard<'static, Option<Clock>> {
+    CLOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Device method: a frame every `length` microseconds. The period is how
+/// many intervals a frame may take to reach the display (pipeline depth),
+/// not part of the rate.
+pub(crate) extern "system" fn set_interval(
+    _: This,
+    _output: This,
+    length: u32,
+    _period: u32,
+    _flags: u32,
+) -> HRESULT {
+    let interval = match length {
+        0 => SIXTIETH,
+        us => Duration::from_micros(u64::from(us)),
+    };
+    tracing::info!(?interval, "frame interval");
+    // A new interval starts from now, after the last tick handed out.
+    let first = LAST
+        .iter()
+        .map(|t| t.load(Ordering::Relaxed))
+        .max()
+        .unwrap_or(0);
+    *clock() = Some(Clock {
+        start: Instant::now(),
+        interval,
+        first,
+    });
+    S_OK
+}
+
+/// Device method: events are scheduled at every tick.
+pub(crate) extern "system" fn schedule(
+    _: This,
+    _kind: u32,
+    _offset: u32,
+    _list: *const u8,
+    _flags: u32,
+) -> HRESULT {
+    S_OK
+}
 
 /// Frames begun so far (frame waits that ended).
 pub(crate) fn current() -> u64 {
     FRAME.load(Ordering::Relaxed)
 }
 
-fn clock() -> MutexGuard<'static, Option<Clock>> {
-    CLOCK.lock().unwrap_or_else(|e| e.into_inner())
-}
+/// Per event kind (origin, vblank, flip and later kinds): the last tick a
+/// wait for it ended on.
+static LAST: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 fn last(kind: u32) -> &'static AtomicU64 {
     &LAST[(kind as usize).min(LAST.len() - 1)]
 }
 
-fn ensure_clock(slot: &mut Option<Clock>) -> &mut Clock {
-    slot.get_or_insert_with(|| Clock {
+/// The next tick after now and after the last one a wait for `kind` ended
+/// on (an event happens once per tick: a wait woken a little early must not
+/// let the next one end on the same tick), and how long until it.
+fn next_tick(kind: u32) -> (u64, Duration) {
+    let mut clock = clock();
+    let c = clock.get_or_insert_with(|| Clock {
         start: Instant::now(),
         interval: SIXTIETH,
         first: 0,
-        offsets_us: [0; 4],
-    })
-}
-
-/// `SetFrameIntervalX(output, period_us, count, flags)`.
-pub(crate) extern "system" fn set_interval(
-    _: This,
-    _output: This,
-    period_us: u32,
-    count: u32,
-    _flags: u32,
-) -> HRESULT {
-    let interval = Duration::from_micros(u64::from(period_us) * u64::from(count));
-    if interval.is_zero() {
-        return E_INVALIDARG;
-    }
-    tracing::debug!(?interval, "frame interval");
-    let now = Instant::now();
-    let mut guard = clock();
-    let mut offsets_us = [0; 4];
-    let first = match guard.as_ref() {
-        Some(c) => {
-            offsets_us = c.offsets_us;
-            let elapsed = now.saturating_duration_since(c.start).as_nanos();
-            c.first + (elapsed / c.interval.as_nanos().max(1)) as u64
-        }
-        None => 0,
-    };
-    *guard = Some(Clock {
-        start: now,
-        interval,
-        first,
-        offsets_us,
     });
-    S_OK
+    let elapsed = c.start.elapsed().as_nanos();
+    let interval = c.interval.as_nanos().max(1);
+    let tick =
+        (c.first + (elapsed / interval + 1) as u64).max(last(kind).load(Ordering::Relaxed) + 1);
+    let at = u128::from(tick - c.first) * interval;
+    (
+        tick,
+        Duration::from_nanos(at.saturating_sub(elapsed) as u64),
+    )
 }
 
-/// `ScheduleFrameEventX(kind, offset_us, flags)`: records the per-event offset
-/// within the frame interval (clamped below one full interval).
-pub(crate) extern "system" fn schedule(
-    _: This,
-    kind: u32,
-    offset_us: u32,
-    _flags: u32,
-) -> HRESULT {
-    let mut guard = clock();
-    let c = ensure_clock(&mut guard);
-    let slot = (kind as usize).min(c.offsets_us.len() - 1);
-    let max_offset = (c.interval.as_micros() as u32).saturating_sub(1);
-    c.offsets_us[slot] = offset_us.min(max_offset);
-    S_OK
-}
-
-/// Pure deadline calculation for the next tick strictly after `last_tick`.
-/// Returns `(tick, target_instant)` without accumulated drift across frames.
-fn compute_next_deadline(
-    start: Instant,
-    interval: Duration,
-    first: u64,
-    offset: Duration,
-    last_tick: u64,
-    now: Instant,
-) -> (u64, Instant) {
-    let interval_ns = interval.as_nanos().max(1);
-    let offset_ns = offset.as_nanos().min(interval_ns.saturating_sub(1));
-    let elapsed_ns = now.saturating_duration_since(start).as_nanos();
-    // Solve `first + k` such that `k * interval_ns + offset_ns > elapsed_ns`.
-    let k_from_clock = if elapsed_ns < offset_ns {
-        0u64
-    } else {
-        ((elapsed_ns - offset_ns) / interval_ns + 1) as u64
-    };
-    let tick = (first + k_from_clock).max(last_tick + 1);
-    let target_ns = u128::from(tick - first) * interval_ns + offset_ns;
-    // Split nanoseconds cleanly into Duration (safe up to >500 years).
-    let secs = (target_ns / 1_000_000_000) as u64;
-    let nanos = (target_ns % 1_000_000_000) as u32;
-    let target = start + Duration::new(secs, nanos);
-    (tick, target)
-}
-
-/// The next tick for `kind` and its exact target `Instant`.
-fn next_tick(kind: u32, now: Instant) -> (u64, Instant) {
-    let mut guard = clock();
-    let c = ensure_clock(&mut guard);
-    let slot = (kind as usize).min(c.offsets_us.len() - 1);
-    let offset = Duration::from_micros(u64::from(c.offsets_us[slot]));
-    let prev = last(kind).load(Ordering::Relaxed);
-    compute_next_deadline(c.start, c.interval, c.first, offset, prev, now)
-}
-
-/// Sleeps accurately until `deadline` using a Windows high-resolution waitable
-/// timer plus a sub-millisecond spin-tail so frame pacing does not drift on
-/// Windows' default 15.6 ms scheduler tick.
-fn sleep_until(deadline: Instant) {
-    let now = Instant::now();
-    if now >= deadline {
-        return;
-    }
-    let remaining = deadline - now;
-    if remaining > SPIN_MARGIN {
-        let coarse = remaining - SPIN_MARGIN;
-        sleep_precise(coarse);
-    }
-    while Instant::now() < deadline {
-        std::hint::spin_loop();
-    }
-}
-
-#[cfg(windows)]
-fn sleep_precise(duration: Duration) {
-    use std::cell::Cell;
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-    use windows_sys::Win32::System::Threading::{
-        CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateWaitableTimerExW, INFINITE,
-        SetWaitableTimer, TIMER_ALL_ACCESS, WaitForSingleObject,
-    };
-
-    struct Timer(HANDLE);
-    impl Drop for Timer {
-        fn drop(&mut self) {
-            if !self.0.is_null() {
-                // SAFETY: handle created by `CreateWaitableTimerExW` for this thread.
-                unsafe { CloseHandle(self.0) };
-            }
-        }
-    }
-
-    thread_local! {
-        static HI_RES_TIMER: Cell<Option<Timer>> = const { Cell::new(None) };
-    }
-
-    let waited = HI_RES_TIMER.with(|cell| {
-        let mut timer = cell.take();
-        if timer.is_none() {
-            // SAFETY: creating a thread-local unnamed high-resolution waitable timer.
-            let handle = unsafe {
-                CreateWaitableTimerExW(
-                    std::ptr::null(),
-                    std::ptr::null(),
-                    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
-                    TIMER_ALL_ACCESS,
-                )
-            };
-            if !handle.is_null() {
-                timer = Some(Timer(handle));
-            }
-        }
-        let ok = if let Some(ref t) = timer {
-            // Relative negative due time in 100-nanosecond intervals.
-            let ticks_100ns = (duration.as_nanos() / 100).max(1);
-            let due = -(i64::try_from(ticks_100ns).unwrap_or(i64::MAX));
-            // SAFETY: valid waitable timer handle and due time pointer.
-            unsafe {
-                SetWaitableTimer(t.0, &due, 0, None, std::ptr::null(), 0) != 0
-                    && WaitForSingleObject(t.0, INFINITE) == 0
-            }
-        } else {
-            false
-        };
-        cell.set(timer);
-        ok
-    });
-    if !waited {
-        std::thread::sleep(duration);
-    }
-}
-
-#[cfg(not(windows))]
-fn sleep_precise(duration: Duration) {
-    std::thread::sleep(duration);
-}
-
-/// `WaitFrameEventX(kind, timeout_ms, event, token)`: sleeps until the next
-/// tick of `kind` (or `timeout_ms`) and writes the token. A zero timeout
-/// returns immediately without yielding or sleeping.
+/// Device method: blocks until the next tick (or the time-out); an origin
+/// wait then hands out the new frame's token. Other events keep the token
+/// the title passes. Ticks are absolute (start plus whole intervals), so
+/// lateness never accumulates.
 pub(crate) extern "system" fn wait(
     _: This,
     kind: u32,
     timeout_ms: u32,
-    _event: *mut u8,
+    _list: *const u8,
+    flags: u32,
     token: *mut u64,
 ) -> HRESULT {
-    let now = Instant::now();
-    let (tick, target) = next_tick(kind, now);
-    let wait = target.saturating_duration_since(now);
+    let origin = kind == ORIGIN;
+    let (mut tick, mut wait) = next_tick(kind);
     let limit = Duration::from_millis(u64::from(timeout_ms));
+    // A blocking wait for an event that has happened since the last wait
+    // for it ended (a frame took longer than a tick) ends at once, on the
+    // tick that passed: sleeping on to the next one cost 17 ms of every
+    // 730 ms frame (run 58: "2.0 frame waits sleeping 16.8 ms"). Polls (a
+    // time-out shorter than a tick) answer as before.
+    // `VICTORY_LATE_WAITS=1` sleeps to the next tick, as before.
+    static SLEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*SLEEP.get_or_init(|| std::env::var_os("VICTORY_LATE_WAITS").is_some_and(|v| v == "1"))
+        && limit >= wait
+        && tick > last(kind).load(Ordering::Relaxed) + 1
+    {
+        tick -= 1;
+        wait = Duration::ZERO;
+    }
     let hr = if wait > limit {
-        if !limit.is_zero() {
-            sleep_until(now + limit);
-        }
+        std::thread::sleep(limit);
         TIMEOUT
     } else {
-        if !wait.is_zero() {
-            sleep_until(target);
-        }
+        std::thread::sleep(wait);
         last(kind).fetch_max(tick, Ordering::Relaxed);
-        FRAME.fetch_add(1, Ordering::Relaxed);
         S_OK
     };
-    if !token.is_null() {
-        // SAFETY: optional out parameter.
-        unsafe { token.write(if hr == S_OK { tick } else { 0 }) };
+    #[cfg(all(windows, feature = "diagnostics"))]
+    {
+        use crate::copystat::{C, add};
+        add(C::PaceWaits, 1);
+        add(C::PaceUs, wait.min(limit).as_micros() as u64);
     }
+    // A frame begun on a time-out takes no tick: its flip still does.
+    if origin && (hr == S_OK || flags & TOKEN_ON_TIMEOUT != 0) {
+        // Tokens count frames (consecutive), not ticks.
+        let frame = FRAME.fetch_add(1, Ordering::Relaxed) + 1;
+        if !token.is_null() {
+            // SAFETY: checked non-null; the title passes its token.
+            unsafe { token.write(frame) };
+        }
+    }
+    #[cfg(feature = "diagnostics")]
+    tracing::debug!(
+        kind,
+        timeout_ms,
+        flags,
+        hr,
+        tick,
+        wait_us = wait.as_micros() as u64,
+        frame = current(),
+        "frame wait"
+    );
     hr
 }
 
-/// `GetFrameStatisticsX(count, stats)`: zeroed counts and timestamps for now.
-pub(crate) extern "system" fn statistics(_: This, count: u32, stats: *mut u8) -> HRESULT {
-    if stats.is_null() {
-        return E_INVALIDARG;
+/// Device method: no statistics are kept, so none are returned.
+pub(crate) extern "system" fn statistics(
+    _: This,
+    _token: u64,
+    _kinds: u32,
+    count: *mut u32,
+    _out: *mut u8,
+) -> HRESULT {
+    if !count.is_null() {
+        // SAFETY: checked non-null.
+        unsafe { count.write(0) };
     }
-    const ENTRY: usize = 0x58;
-    // SAFETY: the title passes room for `count` `D3D12XBOX_FRAME_PIPELINE_STATISTICS`.
-    unsafe { stats.write_bytes(0, count as usize * ENTRY) };
     S_OK
 }
 
@@ -279,48 +199,48 @@ mod tests {
     use super::*;
 
     #[test]
-    fn compute_next_deadline_has_no_cumulative_drift() {
-        let start = Instant::now();
-        let interval = Duration::from_micros(16_667);
-        // Simulate 120 frames with small random jitter around each deadline.
-        let mut last_tick = 0;
-        for frame in 1..=120u64 {
-            // Arrive 2 ms early before tick `frame`.
-            let now = start + interval * (frame as u32) - Duration::from_millis(2);
-            let (tick, target) =
-                compute_next_deadline(start, interval, 0, Duration::ZERO, last_tick, now);
-            assert_eq!(tick, frame);
-            assert_eq!(target, start + interval * (frame as u32));
-            last_tick = tick;
-        }
-    }
-
-    #[test]
-    fn compute_next_deadline_honors_event_offset() {
-        let start = Instant::now();
-        let interval = Duration::from_millis(16);
-        let offset = Duration::from_millis(4);
-        let (tick, target) = compute_next_deadline(start, interval, 10, offset, 9, start);
-        assert_eq!(tick, 10);
-        assert_eq!(target, start + offset);
-
-        let (tick2, target2) = compute_next_deadline(
-            start,
-            interval,
-            10,
-            offset,
-            10,
-            start + Duration::from_millis(5),
-        );
-        assert_eq!(tick2, 11);
-        assert_eq!(target2, start + interval + offset);
-    }
-
-    #[test]
-    fn set_interval_rejects_zero() {
+    fn waits_end_on_ticks_and_count_frames() {
+        let null = std::ptr::null();
+        assert_eq!(set_interval(null, null, 2_000, 1, 0), S_OK);
+        let mut first = 0;
+        assert_eq!(wait(null, 0, 1_000, std::ptr::null(), 0, &mut first), S_OK);
+        let before = Instant::now();
+        let mut second = 0;
+        assert_eq!(wait(null, 0, 1_000, std::ptr::null(), 0, &mut second), S_OK);
+        assert!(second > first);
+        assert!(before.elapsed() <= Duration::from_millis(50));
+        assert_eq!(wait(null, 0, 0, std::ptr::null(), 0, &mut second), TIMEOUT);
+        // Tokens count frames, a frame started early on a time-out too.
+        let mut early = 0;
+        let flags = TOKEN_ON_TIMEOUT;
         assert_eq!(
-            set_interval(std::ptr::null_mut(), std::ptr::null_mut(), 0, 1, 0),
-            E_INVALIDARG
+            wait(null, 0, 0, std::ptr::null(), flags, &mut early),
+            TIMEOUT
         );
+        let mut next = 0;
+        assert_eq!(wait(null, 0, 1_000, std::ptr::null(), 0, &mut next), S_OK);
+        assert!(early == second + 1 && next == early + 1);
+        assert!(LAST[0].load(Ordering::Relaxed) >= 2);
+
+        // The title's loop (the clock is global, so in the same test): an
+        // origin poll that times out (and starts the frame), then a
+        // blocking flip wait. Each flip takes its own tick.
+        const FLIP: u32 = 2;
+        assert_eq!(set_interval(null, null, 5_000, 3, 0), S_OK);
+        let mut token = 0;
+        let flips: Vec<u64> = (0..4)
+            .map(|_| {
+                let _ = wait(null, 0, 0, std::ptr::null(), TOKEN_ON_TIMEOUT, &mut token);
+                assert_eq!(
+                    wait(null, FLIP, u32::MAX, std::ptr::null(), 0, &mut token),
+                    S_OK
+                );
+                LAST[2].load(Ordering::Relaxed)
+            })
+            .collect();
+        assert!(flips.windows(2).all(|w| w[1] == w[0] + 1), "{flips:?}");
+        // Even when a flip wait begins on the tick another just ended on.
+        let (tick, _) = next_tick(FLIP);
+        assert!(tick > flips[3]);
     }
 }

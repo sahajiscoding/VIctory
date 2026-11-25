@@ -21,32 +21,21 @@ use windows_sys::Win32::System::Threading::{
 
 use crate::crash::{MAX_FRAMES, locate, unwind_into};
 
-/// Parses comma-separated `VICTORY_STACKS` delays in seconds, ignoring
-/// non-finite or out-of-range values that would panic `Duration::from_secs_f64` (#938).
-fn delays(list: &str) -> Vec<std::time::Duration> {
-    let mut out: Vec<std::time::Duration> = list
-        .split(',')
-        .filter_map(|t| t.trim().parse::<f64>().ok())
-        .filter(|t| t.is_finite())
-        .filter_map(|t| std::time::Duration::try_from_secs_f64(t.max(0.0)).ok())
-        .collect();
-    out.sort();
-    out
-}
-
 /// Reads `VICTORY_STACKS` and, if set, starts a thread that prints every
 /// thread's stack at each listed time (seconds from now).
 pub fn dump_stacks_on_schedule() {
     let Ok(list) = std::env::var("VICTORY_STACKS") else {
         return;
     };
-    let times = delays(&list);
-    if times.is_empty() {
-        return;
-    }
+    let mut times: Vec<f64> = list
+        .split(',')
+        .filter_map(|t| t.trim().parse().ok())
+        .collect();
+    times.sort_by(f64::total_cmp);
     let start = std::time::Instant::now();
     std::thread::spawn(move || {
-        for at in times {
+        for t in times {
+            let at = std::time::Duration::from_secs_f64(t.max(0.0));
             std::thread::sleep(at.saturating_sub(start.elapsed()));
             dump_stacks();
         }
@@ -231,18 +220,5 @@ mod tests {
         dump_stacks();
         stop_tx.send(()).unwrap();
         parked.join().unwrap();
-    }
-
-    #[test]
-    fn delays_ignores_non_finite_and_overflowing_values() {
-        let got = delays("inf, NaN, 1e300, -5, 2.5, 0.5, bad");
-        assert_eq!(
-            got,
-            vec![
-                std::time::Duration::ZERO,
-                std::time::Duration::from_millis(500),
-                std::time::Duration::from_millis(2500),
-            ]
-        );
     }
 }

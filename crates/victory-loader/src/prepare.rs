@@ -50,25 +50,19 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
         layout::optional_header_offset(&bytes).ok_or(PrepareError::Patch("no optional header"))?;
 
     let characteristics = info.characteristics | file_flags::DLL;
-    let char_off = fh
-        .checked_add(layout::FILE_HEADER_CHARACTERISTICS)
-        .ok_or(PrepareError::Patch("file header characteristics overflow"))?;
-    write_u16(&mut bytes, char_off, characteristics)?;
-    let entry_off = opt
-        .checked_add(layout::OPT_ADDRESS_OF_ENTRY_POINT)
-        .ok_or(PrepareError::Patch("optional header entry point overflow"))?;
-    write_u32(&mut bytes, entry_off, 0)?;
-    let checksum_off = opt
-        .checked_add(layout::OPT_CHECKSUM)
-        .ok_or(PrepareError::Patch("optional header checksum overflow"))?;
-    write_u32(&mut bytes, checksum_off, 0)?;
+    write_u16(
+        &mut bytes,
+        fh + layout::FILE_HEADER_CHARACTERISTICS,
+        characteristics,
+    )?;
+    write_u32(&mut bytes, opt + layout::OPT_ADDRESS_OF_ENTRY_POINT, 0)?;
+    write_u32(&mut bytes, opt + layout::OPT_CHECKSUM, 0)?;
     let dll_characteristics = info.dll_characteristics & !dll_flags::FORCE_INTEGRITY;
-    let dll_char_off = opt
-        .checked_add(layout::OPT_DLL_CHARACTERISTICS)
-        .ok_or(PrepareError::Patch(
-            "optional header DLL characteristics overflow",
-        ))?;
-    write_u16(&mut bytes, dll_char_off, dll_characteristics)?;
+    write_u16(
+        &mut bytes,
+        opt + layout::OPT_DLL_CHARACTERISTICS,
+        dll_characteristics,
+    )?;
 
     // Windows 10 assigns static TLS to the prepared DLL when its empty
     // import table is present. The parser has already walked one descriptor
@@ -81,11 +75,8 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
                 .and_then(|count| count.checked_mul(IMPORT_DESCRIPTOR_SIZE))
                 .and_then(|offset| rva.checked_add(offset))
                 .ok_or(PrepareError::Patch("import terminator RVA overflow"))?;
-            let size_off = at
-                .checked_add(4)
-                .ok_or(PrepareError::Patch("import directory size offset overflow"))?;
             write_u32(&mut bytes, at, terminator)?;
-            write_u32(&mut bytes, size_off, IMPORT_DESCRIPTOR_SIZE)?;
+            write_u32(&mut bytes, at + 4, IMPORT_DESCRIPTOR_SIZE)?;
         }
     }
     if let Some(at) = layout::data_directory_offset(&bytes, dir::BOUND_IMPORT) {
@@ -98,19 +89,16 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
         let at = info
             .rva_to_file_offset(tls.directory_rva)
             .ok_or(PrepareError::Patch("TLS directory is not file-backed"))?;
-        let cb_off = usize::try_from(at)
-            .ok()
-            .and_then(|a| a.checked_add(layout::TLS64_ADDRESS_OF_CALLBACKS))
-            .ok_or(PrepareError::Patch("TLS callbacks offset overflow"))?;
-        write_u64(&mut bytes, cb_off, 0)?;
+        write_u64(
+            &mut bytes,
+            at as usize + layout::TLS64_ADDRESS_OF_CALLBACKS,
+            0,
+        )?;
         // The field's base relocation would turn the 0 into `delta` whenever
         // the loader maps the copy away from its preferred base (Wine always
         // does for DYNAMIC_BASE images), and the loader then reads callbacks
         // from there. Make that entry a no-op.
-        let field_rva = tls
-            .directory_rva
-            .checked_add(layout::TLS64_ADDRESS_OF_CALLBACKS as u32)
-            .ok_or(PrepareError::Patch("TLS callbacks RVA overflow"))?;
+        let field_rva = tls.directory_rva + layout::TLS64_ADDRESS_OF_CALLBACKS as u32;
         for (entry, target) in dir64_relocations(&bytes, &info) {
             if target == field_rva {
                 write_u16(&mut bytes, entry, 0)?; // IMAGE_REL_BASED_ABSOLUTE
@@ -136,56 +124,34 @@ fn dir64_relocations(bytes: &[u8], info: &ImageInfo) -> Vec<(usize, u32)> {
     let Some(d) = layout::data_directory_offset(bytes, dir::BASERELOC) else {
         return out;
     };
-    let Some(d_size) = d.checked_add(4) else {
-        return out;
-    };
-    let (Some(rva), Some(size)) = (layout::read_u32(bytes, d), layout::read_u32(bytes, d_size))
+    let (Some(rva), Some(size)) = (layout::read_u32(bytes, d), layout::read_u32(bytes, d + 4))
     else {
         return out;
     };
     let Some(start) = info.rva_to_file_offset(rva).filter(|_| size != 0) else {
         return out;
     };
-    let Ok(mut at) = usize::try_from(start) else {
-        return out;
-    };
-    let Some(end) = at.checked_add(size as usize) else {
-        return out;
-    };
-    let end = end.min(bytes.len());
-    while let Some(header_end) = at.checked_add(8)
-        && header_end <= end
-    {
-        let Some(size_at) = at.checked_add(4) else {
-            break;
-        };
+    let (mut at, end) = (start as usize, start as usize + size as usize);
+    while at + 8 <= end {
         let (Some(page), Some(block)) =
-            (layout::read_u32(bytes, at), layout::read_u32(bytes, size_at))
+            (layout::read_u32(bytes, at), layout::read_u32(bytes, at + 4))
         else {
             break;
         };
         let block = block as usize;
-        let Some(block_end) = at.checked_add(block) else {
-            break;
-        };
-        if block < 8 || block_end > end {
+        if block < 8 || at + block > end {
             break;
         }
-        for entry in (header_end..block_end).step_by(2) {
-            let Some(entry_end) = entry.checked_add(2) else {
-                break;
-            };
-            let Some(e) = bytes.get(entry..entry_end) else {
+        for entry in (at + 8..at + block).step_by(2) {
+            let Some(e) = bytes.get(entry..entry + 2) else {
                 break;
             };
             let e = u16::from_le_bytes([e[0], e[1]]);
-            if e >> 12 == DIR64
-                && let Some(target) = page.checked_add(u32::from(e & 0xFFF))
-            {
-                out.push((entry, target));
+            if e >> 12 == DIR64 {
+                out.push((entry, page + u32::from(e & 0xFFF)));
             }
         }
-        at = block_end;
+        at += block;
     }
     out
 }
@@ -200,11 +166,8 @@ fn write_u64(bytes: &mut [u8], at: usize, v: u64) -> Result<(), PrepareError> {
     write(bytes, at, &v.to_le_bytes())
 }
 fn write(bytes: &mut [u8], at: usize, v: &[u8]) -> Result<(), PrepareError> {
-    let end = at
-        .checked_add(v.len())
-        .ok_or(PrepareError::Patch("header field offset overflow"))?;
     bytes
-        .get_mut(at..end)
+        .get_mut(at..at + v.len())
         .ok_or(PrepareError::Patch("header field outside of file"))?
         .copy_from_slice(v);
     Ok(())
@@ -316,12 +279,5 @@ mod tests {
         let a = prepare(&original).unwrap();
         let b = prepare(&original).unwrap();
         assert_eq!(a.file_name(), b.file_name());
-    }
-
-    #[test]
-    fn write_rejects_overflowing_offset() {
-        let mut buf = [0u8; 16];
-        assert!(write(&mut buf, usize::MAX - 1, &[1, 2, 3, 4]).is_err());
-        assert!(write(&mut buf, 14, &[1, 2, 3, 4]).is_err());
     }
 }

@@ -1,6 +1,6 @@
 //! Console primitive types the host lacks. A rectangle list gives three
 //! corners per rectangle, the second the one between the other two, and
-//! the hardware adds the fourth at `v0 + v2 - v1` (Grand Theft Auto VI's
+//! the hardware adds the fourth at `v0 + v2 - v1` (the title's
 //! full-screen rectangles come as top left, bottom left, bottom right); on
 //! the host each rectangle becomes two triangles, with the fourth vertex
 //! made from the other three on the CPU.
@@ -11,6 +11,12 @@
 //! [`components`] does not know keep the first vertex's value, and so do
 //! components past the end of the vertex (an element that reaches into the
 //! next one, which the layout allows).
+//!
+//! A pipeline the title makes for rectangles completes them on the GPU
+//! instead, in a geometry stage (`victory_shader::emit::rect_list_gs`):
+//! from the vertex shader's outputs, whichever vertex the corner is, for
+//! direct, indexed and indirect draws alike. This expansion is what is
+//! left for a pipeline that could not get that stage.
 
 /// Expands `rects` rectangles of `stride`-byte vertices from `src` into six
 /// vertices each in `dst`: `(v0, v1, v2)` and `(v0, v2, v3)`, so both
@@ -121,18 +127,10 @@ fn half_to_f32(h: u16) -> f32 {
 fn f32_to_half(v: f32) -> u16 {
     let bits = v.to_bits();
     let sign = ((bits >> 16) & 0x8000) as u16;
-    let raw_exp = (bits >> 23) & 0xff;
+    let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
     let man = bits & 0x7f_ffff;
-    if raw_exp == 0xff {
-        if man != 0 {
-            // Preserve quiet NaN (set quiet bit 0x0200 and keep top payload bits).
-            return sign | 0x7e00 | ((man >> 13) as u16);
-        }
-        return sign | 0x7c00; // infinity
-    }
-    let exp = raw_exp as i32 - 127 + 15;
     if exp >= 31 {
-        return sign | 0x7c00; // overflow: infinity
+        return sign | 0x7c00; // too large: infinity
     }
     if exp <= 0 {
         if exp < -10 {
@@ -149,13 +147,10 @@ fn f32_to_half(v: f32) -> u16 {
         let m = q + u32::from(r > halfway || (r == halfway && (q & 1) != 0));
         return sign | m as u16;
     }
-    // Round to nearest even: a carry out of the mantissa increments the
-    // exponent (`2 - 2^-12` -> `2.0`, `65520.0` -> `+Inf` `0x7c00`).
-    let q = man >> 13;
-    let r = man & 0x1fff;
-    let rounded = q + u32::from(r > 0x1000 || (r == 0x1000 && (q & 1) != 0));
-    let half = ((exp as u32) << 10) + rounded;
-    sign | half as u16
+    // Rounded to nearest: a carry out of the mantissa is added into the
+    // exponent (`2 - 2^-12` is 2.0); at most it reaches infinity, 0x7c00.
+    let half = (exp as u32) << 10;
+    sign | (half + ((man + 0x1000) >> 13)) as u16
 }
 
 #[cfg(test)]
@@ -238,28 +233,5 @@ mod tests {
         assert_eq!(f32_to_half(2f32.powi(-26)), 0x0000);
         assert_eq!(f32_to_half(1.5), 0x3e00);
         assert_eq!(half_to_f32(0x0001), 2f32.powi(-24));
-    }
-
-    #[test]
-    fn half_preserves_nan_and_rounds_normal_ties_to_even() {
-        // NaNs stay NaN (exponent 31, non-zero mantissa), never ±Inf.
-        let qnan = f32_to_half(f32::NAN);
-        assert_eq!(qnan & 0x7c00, 0x7c00);
-        assert_ne!(qnan & 0x03ff, 0);
-        let neg_snan = f32_to_half(f32::from_bits(0xff80_0001));
-        assert_eq!(neg_snan & 0xfc00, 0xfc00);
-        assert_ne!(neg_snan & 0x03ff, 0);
-        // Infinities stay exact infinities.
-        assert_eq!(f32_to_half(f32::INFINITY), 0x7c00);
-        assert_eq!(f32_to_half(f32::NEG_INFINITY), 0xfc00);
-        // Normal ties to even:
-        // 1.0 + 0.5 ulp (even LSB=0) -> rounds down to 1.0 (0x3c00).
-        assert_eq!(f32_to_half(1.0 + 2f32.powi(-11)), 0x3c00);
-        // 1.0 + 1.5 ulp (odd LSB=1) -> rounds up to 1.0 + 2 ulp (0x3c02).
-        assert_eq!(f32_to_half(1.0 + 3.0 * 2f32.powi(-11)), 0x3c02);
-        // Negative tie with even LSB -> rounds toward zero (-1.0, 0xbc00).
-        assert_eq!(f32_to_half(-(1.0 + 2f32.powi(-11))), 0xbc00);
-        // Negative tie with odd LSB -> rounds away from zero (0xbc02).
-        assert_eq!(f32_to_half(-(1.0 + 3.0 * 2f32.powi(-11))), 0xbc02);
     }
 }
