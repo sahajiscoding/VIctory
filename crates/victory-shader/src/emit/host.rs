@@ -45,16 +45,19 @@ pub fn probe_host() -> Result<AdapterReport, String> {
             let adapter: IDXGIAdapter = factory.EnumWarpAdapter().map_err(|e| e.to_string())?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)
                 .map_err(|e| e.to_string())?;
-        } else if let Ok(f6) = factory.cast::<IDXGIFactory6>()
-            && let Ok(adapter) = f6
-                .EnumAdapterByGpuPreference::<IDXGIAdapter>(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE)
-            && D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_ok()
-            && device.is_some()
-        {
-            // Selected high-performance adapter.
         } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)
-                .map_err(|e| e.to_string())?;
+            if let Ok(f6) = factory.cast::<IDXGIFactory6>()
+                && let Ok(adapter) = f6.EnumAdapterByGpuPreference::<IDXGIAdapter>(
+                    0,
+                    DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+                )
+            {
+                let _ = D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device);
+            }
+            if device.is_none() {
+                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)
+                    .map_err(|e| e.to_string())?;
+            }
         }
         let device = device.ok_or_else(|| "no Direct3D 12 device".to_owned())?;
         let desc = factory
