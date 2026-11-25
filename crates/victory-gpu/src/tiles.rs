@@ -1404,12 +1404,12 @@ void look() {
         read_as_given(rig, "more levels without room");
         // The card's own write is not kept waiting, and brings only its
         // own level: level 1 still waits although it is held.
-        assert_eq!(tiled.claim(1 << 0), 1 << 0);
-        let changed = tiled.card_wrote_on(&rig.queue, &rig.device, &texture, 1 << 0);
+        assert_eq!(tiled.claim(1), 1);
+        let changed = tiled.card_wrote_on(&rig.queue, &rig.device, &texture, 1);
         rig.check("the card's own write, without room");
         assert!(changed && tiled.has_tiles(0) && !tiled.has_tiles(1) && !tiled.has_tiles(2));
         assert_eq!(tiled.first_shown(), Some(0));
-        assert_eq!(tiled.claim(1 << 0), 0, "a level with tiles is not claimed again");
+        assert_eq!(tiled.claim(1), 0, "a level with tiles is not claimed again");
         // With room everything held gets its tiles.
         let (_, waiting) = tiled.uploaded_on(&rig.queue, &rig.device, &texture, from_level(1), true);
         rig.check("the last upload, with room");
@@ -1570,12 +1570,12 @@ void look() {
             card: AtomicU32::new(0),
             claimed: AtomicU32::new(0),
         };
-        assert_eq!(tiled.claim(1 << 0), 1 << 0);
-        let changed = tiled.card_wrote_on(host.queue(), &host.device, &tex, 1 << 0);
+        assert_eq!(tiled.claim(1), 1);
+        let changed = tiled.card_wrote_on(host.queue(), &host.device, &tex, 1);
         assert!(!changed);
         assert_eq!(tiled.card.load(Ordering::Relaxed), 0, "failed tile allocation must not poison `card`");
         assert_eq!(tiled.first_shown(), None);
-        assert_eq!(tiled.claim(1 << 0), 1 << 0, "failed level must be unclaimed");
+        assert_eq!(tiled.claim(1), 1, "failed level must be unclaimed");
         // Even if level 0 later becomes allocatable, an upload with `room == false`
         // that does not hold level 0 must not treat level 0 as card-owned.
         tiled.standard[0] = 1;

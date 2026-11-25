@@ -7163,8 +7163,7 @@ pub fn hdr_info() -> crate::HdrInfo {
         if let Some(raw) = std::env::var_os("VICTORY_HDR") {
             let enabled = raw
                 .to_str()
-                .map(|s| !matches!(s.trim(), "" | "0" | "false" | "off" | "no"))
-                .unwrap_or(true);
+                .is_none_or(|s| !matches!(s.trim(), "" | "0" | "false" | "off" | "no"));
             if !enabled {
                 return crate::HdrInfo::default();
             }

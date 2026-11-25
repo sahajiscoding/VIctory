@@ -755,6 +755,7 @@ impl HostPipeline {
 }
 
 /// A stream subobject: its type, then its description, pointer-aligned.
+#[allow(dead_code)]
 #[repr(C, align(8))]
 struct Sub<T>(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE, T);
 
@@ -789,6 +790,7 @@ fn graphics_depth_bounds_pipeline(
     name: &str,
 ) -> windows::core::Result<ID3D12PipelineState> {
     use windows::core::Interface;
+    #[allow(dead_code)]
     #[repr(C)]
     struct Stream {
         root: Sub<*mut std::ffi::c_void>,
@@ -805,6 +807,7 @@ fn graphics_depth_bounds_pipeline(
         dsv: Sub<DXGI_FORMAT>,
         samples: Sub<DXGI_SAMPLE_DESC>,
     }
+    #[allow(dead_code)]
     #[repr(C)]
     struct StreamGs {
         base: Stream,
@@ -862,6 +865,7 @@ fn mesh_pipeline(
     name: &str,
 ) -> windows::core::Result<ID3D12PipelineState> {
     use windows::core::Interface;
+    #[allow(dead_code)]
     #[repr(C)]
     struct Stream<D> {
         root: Sub<*mut std::ffi::c_void>,
@@ -1089,6 +1093,7 @@ mod tests {
         let mut g = GraphicsState::default();
         // Subobject 21 (`DEPTH_STENCIL1`) with `DepthBoundsTestEnable = true`,
         // depth test itself off so only depth bounds gates the draw.
+        #[allow(dead_code)]
         #[repr(C, align(8))]
         struct Sub21(u32, D3D12_DEPTH_STENCIL_DESC1);
         let sub = Sub21(
